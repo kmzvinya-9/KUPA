@@ -28,6 +28,7 @@ export type TelemetryRecord = {
   sdCardWriting: boolean
   sdCardUsage: number
   uptimeSeconds: number
+  pendingQueueCount: number
   temperatureSensorOk: boolean
   phSensorOk: boolean
   turbiditySensorOk: boolean
@@ -336,6 +337,7 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
     sdCardWriting: toBoolean(payload.sdCardWriting),
     sdCardUsage: clamp(toFiniteNumber(payload.sdCardUsage, 0), 0, 100),
     uptimeSeconds: Math.max(0, Math.round(toFiniteNumber(payload.uptimeSeconds, 0))),
+    pendingQueueCount: Math.max(0, Math.round(toFiniteNumber(payload.pendingQueueCount, 0))),
     temperatureSensorOk: hasWater ? toBoolean(payload.temperatureSensorOk, temperatureC > 0) : true,
     phSensorOk: hasWater ? toBoolean(payload.phSensorOk, phVoltage > 0.05) : true,
     turbiditySensorOk: hasWater ? toBoolean(payload.turbiditySensorOk, turbidityVoltage > 0.05) : true,
@@ -378,19 +380,26 @@ export function saveTelemetry(record: TelemetryRecord) {
   return true
 }
 
+function withTelemetryDefaults(record: TelemetryRecord): TelemetryRecord {
+  return {
+    ...record,
+    pendingQueueCount: Number.isFinite(record.pendingQueueCount) ? record.pendingQueueCount : 0,
+  }
+}
+
 export function getTelemetryHistory(limit = MAX_RECORDS) {
   const store = getTelemetryStore()
-  return store.records.slice(-limit)
+  return store.records.slice(-limit).map(withTelemetryDefaults)
 }
 
 export function getLatestReading(): TelemetryRecord | null {
   const store = getTelemetryStore()
-  return store.latest
+  return store.latest ? withTelemetryDefaults(store.latest) : null
 }
 
 export function getDashboardPayload() {
   const store = getTelemetryStore()
-  const latest = store.latest
+  const latest = store.latest ? withTelemetryDefaults(store.latest) : null
   const staleAfterMs = 15000
 
   if (!latest || Date.now() - latest.receivedAt > staleAfterMs) {
@@ -421,6 +430,7 @@ export function getDashboardPayload() {
         sdCardWriting: false,
         sdCardUsage: latest?.sdCardUsage ?? 0,
         uptimeSeconds: latest?.uptimeSeconds ?? 0,
+        pendingQueueCount: latest?.pendingQueueCount ?? 0,
         temperatureSensorOk: latest?.temperatureSensorOk ?? false,
         phSensorOk: latest?.phSensorOk ?? false,
         turbiditySensorOk: latest?.turbiditySensorOk ?? false,

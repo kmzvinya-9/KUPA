@@ -35,6 +35,7 @@ This document defines the telemetry data schema used for communication between t
   "sdCardWriting": "boolean",
   "sdCardUsage": "number (0-100, percent)",
   "uptimeSeconds": "number",
+  "pendingQueueCount": "number",
   
   "temperatureSensorOk": "boolean",
   "phSensorOk": "boolean",
@@ -102,6 +103,7 @@ This document defines the telemetry data schema used for communication between t
 | `sdCardWriting` | boolean | True if currently writing to SD |
 | `sdCardUsage` | number | SD card usage percentage |
 | `uptimeSeconds` | number | Seconds since device boot |
+| `pendingQueueCount` | number | Offline records still waiting on the SD card for dashboard upload |
 
 ### Sensor Health
 | Field | Type | Description |
@@ -157,6 +159,7 @@ This document defines the telemetry data schema used for communication between t
   "sdCardWriting": false,
   "sdCardUsage": 0.02,
   "uptimeSeconds": 694,
+  "pendingQueueCount": 0,
   "temperatureSensorOk": true,
   "phSensorOk": true,
   "turbiditySensorOk": true,

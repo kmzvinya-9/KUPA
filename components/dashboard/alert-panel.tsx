@@ -131,6 +131,7 @@ export function AlertPanel({ alerts }: AlertPanelProps) {
       const payload = (await response.json()) as {
         ok: boolean
         emailed?: boolean
+        queued?: boolean
         emailConfigured?: boolean
         message?: string
         downloadUrl?: string
@@ -238,7 +239,7 @@ export function AlertPanel({ alerts }: AlertPanelProps) {
               </Button>
             </div>
             <p className="mt-2 text-xs text-muted-foreground">
-              Emails include the PDF plus inline graphs for all stored sensors on the selected day.
+              Emails include inline graphs, and the PDF download contains the same chart set.
             </p>
             {requestState.type !== "idle" && (
               <div

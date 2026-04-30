@@ -66,7 +66,7 @@ Setup complete.
 ### Step 2: Continuous Sensor Reading
 Observe the serial output for 30 seconds:
 
-**Expected Output (repeating every 2 seconds):**
+**Expected Output (repeating about every 500ms):**
 ```
 [TANK SCAN] Level: X.X% | Water: YES/NO
 === ESP32 Water Reading ===
@@ -82,7 +82,7 @@ Flow: X.XX L/min (idle/active)
 POST /api/ingest -> 200
 ```
 
-- [ ] Readings update every 2 seconds (not 200ms)
+- [ ] ESP32 readings sample about every 500ms
 - [ ] Temperature shows reasonable value (15-35°C typical)
 - [ ] pH shows reasonable value (6-8 typical for tap water)
 - [ ] Turbidity shows reasonable value
@@ -121,6 +121,8 @@ POST /api/ingest -> 200
 - [ ] ESP32 attempts to reconnect
 - [ ] Reconnects automatically when Wi-Fi returns
 - [ ] Queued data is sent (queue count decreases)
+- [ ] LCD shows `OFFLINE SD:####` while disconnected and still cycles sensor readings
+- [ ] After reconnect, LCD shows `SYNC SD:####` until queued SD data is uploaded
 
 ---
 
@@ -231,7 +233,7 @@ curl http://localhost:3000/api/latest
 **ESP32 → Dashboard Communication:**
 - [ ] ESP32 connects to Wi-Fi
 - [ ] ESP32 reads sensors continuously
-- [ ] ESP32 sends telemetry every 2 seconds
+- [ ] ESP32 samples telemetry every 500ms
 - [ ] ESP32 Serial shows POST success (HTTP 200)
 - [ ] No "Battery protection mode" in Serial output
 - [ ] Sensors are NOT turned off due to battery voltage
@@ -248,6 +250,8 @@ curl http://localhost:3000/api/latest
 **Data Persistence:**
 - [ ] Telemetry is stored in `data/telemetry-latest.json`
 - [ ] Historical records stored in `data/telemetry-history.jsonl`
+- [ ] ESP32 offline records are stored in SD file `/pending_queue.jsonl`
+- [ ] Offline SD queue is uploaded before new live readings are sent after reconnect
 - [ ] Records persist after dashboard restart
 - [ ] Duplicate records are not stored
 

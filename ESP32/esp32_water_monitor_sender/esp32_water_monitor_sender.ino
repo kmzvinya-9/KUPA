@@ -55,10 +55,14 @@ constexpr float TANK_TOTAL_HEIGHT_CM = 13.0f;
 constexpr float TANK_MAX_WATER_HEIGHT_CM = 10.0f;  // Maximum water height is 10cm (not 13cm)
 constexpr float TANK_USABLE_CAPACITY_L = 5.0f;      // 5L capacity
 constexpr float FLOW_HZ_PER_L_MIN = 7.5f;
-constexpr uint32_t POST_INTERVAL_MS = 500;          // 500ms - very close to real-time
+constexpr uint32_t POST_INTERVAL_MS = 500;          // 500ms live sampling with SD fallback
 constexpr uint32_t TANK_SCAN_INTERVAL_MS = 50;      // Tank level scanned every 50ms for fast detection
 constexpr uint32_t LCD_CYCLE_INTERVAL_MS = 1500;    // LCD cycles through readings every 1.5 seconds
-constexpr uint32_t WIFI_RETRY_MS = 5000;            // Faster WiFi retry
+constexpr uint32_t WIFI_RETRY_MS = 5000;            // Non-blocking WiFi retry cadence
+constexpr uint32_t DASHBOARD_RETRY_MS = 3000;       // Avoid blocking every loop when dashboard is down
+constexpr uint32_t QUEUE_FLUSH_INTERVAL_MS = 250;   // Small SD upload slices keep readings responsive
+constexpr uint8_t QUEUE_FLUSH_MAX_RECORDS = 3;
+constexpr uint16_t HTTP_TIMEOUT_MS = 900;
 constexpr float ADC_VREF = 3.3f;
 constexpr float TURBIDITY_VREF = 3.3f;
 constexpr float TURBIDITY_CLEAR_V = TURBIDITY_VREF;
@@ -70,13 +74,15 @@ constexpr float PH_NEUTRAL_DEFAULT = 7.0f;
 constexpr float PH_AUTO_CALIBRATION_ALPHA = 0.02f;
 constexpr float PH_STABLE_DELTA = 0.12f;
 constexpr uint8_t ULTRASONIC_BURST_SAMPLES = 5;
-constexpr unsigned long ULTRASONIC_TIMEOUT_US = 18000UL;
+constexpr unsigned long ULTRASONIC_TIMEOUT_US = 5000UL;
 constexpr float ULTRASONIC_SMOOTHING_ALPHA = 0.85f;
+constexpr unsigned long COLOR_PULSE_TIMEOUT_US = 25000UL;
 constexpr float COLOR_BASELINE_ALPHA = 0.02f;
 constexpr int COLOR_BALANCE_TOLERANCE = 24;
 constexpr int COLOR_BASELINE_MIN = 40;
 constexpr uint32_t SERIAL_BAUD_RATE = 115200;
 const char* SD_LOG_FILE = "/water_log.csv";
+const char* SD_QUEUE_FILE = "/pending_queue.jsonl";
 
 volatile uint32_t flowPulses = 0;
 
@@ -102,7 +108,7 @@ struct Reading {
   bool sdCardWriting;
   float sdCardUsage;
   uint32_t uptimeSeconds;
-  uint16_t pendingQueueCount;
+  uint32_t pendingQueueCount;
   bool temperatureSensorOk;
   bool phSensorOk;
   bool turbiditySensorOk;
@@ -119,8 +125,12 @@ uint32_t lastPostMs = 0;
 uint32_t lastLcdMs = 0;
 uint32_t lastTankScanMs = 0;
 uint32_t lastWifiAttemptMs = 0;
+uint32_t lastDashboardAttemptMs = 0;
+uint32_t lastQueueFlushMs = 0;
 uint8_t lcdCycleIndex = 0;
 bool tankScanTriggered = false;
+bool wifiConnectStarted = false;
+bool dashboardReachable = false;
 float phCalibrationOffset = PH_NEUTRAL_DEFAULT;
 float smoothedPh = 0.0f;
 bool phFirstReading = true;
@@ -133,7 +143,8 @@ float colorBaselineR = 255.0f;
 float colorBaselineG = 255.0f;
 float colorBaselineB = 255.0f;
 bool colorBaselineReady = false;
-uint16_t pendingQueueCount = 0;
+uint32_t pendingQueueCount = 0;
+uint32_t pendingQueueOffset = 0;
 uint32_t recordCounter = 0;
 uint32_t bootId = 0;
 
@@ -182,7 +193,7 @@ float readTrimmedAnalogVoltage(int pin, int sampleCount = 12, int sampleDelayMs 
 
   for (int i = 0; i < sampleCount; i++) {
     values[i] = analogRead(pin);
-    delay(1);
+    delay(sampleDelayMs);
   }
 
   for (int i = 0; i < sampleCount - 1; i++) {
@@ -551,8 +562,8 @@ float readTankLevelPercent(bool &sensorOk) {
 uint32_t readColorPulse(bool s2, bool s3) {
   digitalWrite(PIN_TCS_S2, s2 ? HIGH : LOW);
   digitalWrite(PIN_TCS_S3, s3 ? HIGH : LOW);
-  delay(10);
-  return pulseIn(PIN_TCS_OUT, LOW, 100000UL);
+  delay(3);
+  return pulseIn(PIN_TCS_OUT, LOW, COLOR_PULSE_TIMEOUT_US);
 }
 
 int pulseToColor(uint32_t pulse) {
@@ -600,8 +611,28 @@ float computeSdUsagePercent() {
   return (usedBytes * 100.0f) / totalBytes;
 }
 
+bool isDashboardOnline() {
+  return WiFi.status() == WL_CONNECTED && dashboardReachable;
+}
+
+bool shouldAttemptDashboardNow() {
+  if (WiFi.status() != WL_CONNECTED) {
+    dashboardReachable = false;
+    return false;
+  }
+
+  if (dashboardReachable) return true;
+  if (lastDashboardAttemptMs == 0) return true;
+  return millis() - lastDashboardAttemptMs >= DASHBOARD_RETRY_MS;
+}
+
 void ensureWiFiConnected() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnectStarted = false;
+    return;
+  }
+
+  dashboardReachable = false;
 
   if (millis() - lastWifiAttemptMs < WIFI_RETRY_MS && lastWifiAttemptMs != 0) {
     return;
@@ -609,14 +640,10 @@ void ensureWiFiConnected() {
 
   lastWifiAttemptMs = millis();
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
-    delay(100);
-    Serial.print('.');
-  }
-  Serial.println();
+  wifiConnectStarted = true;
+  Serial.println("WiFi connect attempt started.");
 }
 
 void zeroReading(Reading &r) {
@@ -705,7 +732,10 @@ void buildTelemetryPayload(const Reading &r, const String &timestamp, const Stri
 }
 
 bool sendPayloadToDashboard(const String &body) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    dashboardReachable = false;
+    return false;
+  }
 
   // Validate payload before sending
   if (body.length() == 0) {
@@ -724,10 +754,11 @@ bool sendPayloadToDashboard(const String &body) {
 
   HTTPClient http;
   http.begin(SERVER_URL);
-  http.setTimeout(5000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-api-key", API_KEY);
 
+  lastDashboardAttemptMs = millis();
   int statusCode = http.POST(body);
   String response = http.getString();
   Serial.printf("POST /api/ingest -> %d\n", statusCode);
@@ -735,56 +766,114 @@ bool sendPayloadToDashboard(const String &body) {
     Serial.println(response);
   }
   http.end();
-  return statusCode >= 200 && statusCode < 300;
+  dashboardReachable = statusCode >= 200 && statusCode < 300;
+  return dashboardReachable;
 }
 
-// Simple SD-backed pending queue for failed payloads
+uint32_t countPendingQueueRecords() {
+  if (!sdReady || !SD.exists(SD_QUEUE_FILE)) return 0;
+
+  File f = SD.open(SD_QUEUE_FILE, FILE_READ);
+  if (!f) return 0;
+
+  uint32_t count = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) count++;
+  }
+  f.close();
+  return count;
+}
+
+// SD-backed pending queue for readings that could not reach the dashboard.
 bool enqueuePayloadToSd(const String &body) {
   if (!sdReady) return false;
-  File f = SD.open("/pending_queue.jsonl", FILE_APPEND);
+  if (body.length() == 0) return false;
+
+  const bool queueExisted = SD.exists(SD_QUEUE_FILE);
+  File f = SD.open(SD_QUEUE_FILE, FILE_APPEND);
   if (!f) return false;
   f.println(body);
   f.close();
+
+  if (!queueExisted) {
+    pendingQueueOffset = 0;
+  }
   pendingQueueCount++;
   return true;
 }
 
+void clearPendingQueueIfComplete(size_t queueFileSize) {
+  if (pendingQueueOffset < queueFileSize) return;
+
+  SD.remove(SD_QUEUE_FILE);
+  pendingQueueOffset = 0;
+  pendingQueueCount = 0;
+  latestReading.pendingQueueCount = 0;
+  Serial.println("SD pending queue uploaded.");
+}
+
 void tryFlushPendingQueue() {
   if (!sdReady) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!SD.exists("/pending_queue.jsonl")) return;
-
-  File src = SD.open("/pending_queue.jsonl", FILE_READ);
-  if (!src) return;
-
-  File tmp = SD.open("/pending_queue.tmp", FILE_WRITE);
-  if (!tmp) {
-    src.close();
+  if (pendingQueueCount == 0) return;
+  if (!SD.exists(SD_QUEUE_FILE)) {
+    pendingQueueOffset = 0;
+    pendingQueueCount = 0;
+    return;
+  }
+  if (!shouldAttemptDashboardNow()) return;
+  if (millis() - lastQueueFlushMs < QUEUE_FLUSH_INTERVAL_MS && lastQueueFlushMs != 0) {
     return;
   }
 
-  while (src.available()) {
-    String line = src.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
+  lastQueueFlushMs = millis();
 
-    bool ok = sendPayloadToDashboard(line);
-    if (!ok) {
-      tmp.println(line);
-    } else {
-      if (pendingQueueCount > 0) pendingQueueCount--;
+  File src = SD.open(SD_QUEUE_FILE, FILE_READ);
+  if (!src) return;
+
+  const size_t queueFileSize = src.size();
+  if (pendingQueueOffset >= queueFileSize) {
+    src.close();
+    clearPendingQueueIfComplete(queueFileSize);
+    return;
+  }
+
+  src.seek(pendingQueueOffset);
+
+  uint8_t sentThisPass = 0;
+  while (src.available() && sentThisPass < QUEUE_FLUSH_MAX_RECORDS) {
+    const size_t lineStart = src.position();
+    String line = src.readStringUntil('\n');
+    const size_t lineEnd = src.position();
+    line.trim();
+
+    if (line.length() == 0) {
+      pendingQueueOffset = lineEnd;
+      continue;
     }
-    // Short delay to avoid hammering server
-    delay(20);
+
+    if (!line.startsWith("{") || !line.endsWith("}")) {
+      Serial.println("WARNING: Dropping corrupt SD queue line");
+      pendingQueueOffset = lineEnd;
+      if (pendingQueueCount > 0) pendingQueueCount--;
+      latestReading.pendingQueueCount = pendingQueueCount;
+      continue;
+    }
+
+    if (!sendPayloadToDashboard(line)) {
+      pendingQueueOffset = lineStart;
+      break;
+    }
+
+    pendingQueueOffset = lineEnd;
+    if (pendingQueueCount > 0) pendingQueueCount--;
+    latestReading.pendingQueueCount = pendingQueueCount;
+    sentThisPass++;
   }
 
   src.close();
-  tmp.close();
-
-  SD.remove("/pending_queue.jsonl");
-  if (SD.exists("/pending_queue.tmp")) {
-    SD.rename("/pending_queue.tmp", "/pending_queue.jsonl");
-  }
+  clearPendingQueueIfComplete(queueFileSize);
 }
 
 
@@ -871,56 +960,63 @@ void logToSd(const Reading &r, const String &timestamp, const String &recordId) 
   latestReading.sdCardWriting = false;
 }
 
+void printLcdQueueCount(uint32_t count) {
+  const uint32_t shown = count > 9999UL ? 9999UL : count;
+  lcd.printf("%4lu", static_cast<unsigned long>(shown));
+}
+
 void updateLcd(const Reading &r, uint8_t cycleIndex) {
   lcd.clear();
 
-  // Second line always shows level and volume
   float volumeL = r.tankCapacity * (r.tankLevelPercent / 100.0f);
-  lcd.setCursor(0, 1);
-  lcd.printf("Lv:%2.0f%% Vol:%.1fL", r.tankLevelPercent, volumeL);
 
-  // Prefix/indicator for network state (small visual cue)
-  const bool isOnline = (WiFi.status() == WL_CONNECTED);
-
-  // Priority: show flow when active
-  if (r.flowRateLMin > 0.2f) {
+  if (!isDashboardOnline()) {
     lcd.setCursor(0, 0);
-    if (isOnline) {
-      lcd.printf("Flow:%2.1fL/m", r.flowRateLMin);
-    } else {
-      // If offline, append small OFF marker if space
-      lcd.printf("Flow:%2.1fL/m", r.flowRateLMin);
-      int len = 11; // approx length
-      if (len < 15) {
-        lcd.setCursor(15, 0);
-        lcd.print("O");
-      }
+    lcd.print("OFFLINE SD:");
+    printLcdQueueCount(pendingQueueCount);
+
+    lcd.setCursor(0, 1);
+    switch (cycleIndex % 3) {
+      case 0:
+        lcd.printf("T:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
+        break;
+      case 1:
+        lcd.printf("Tur:%2.0f%% F:%2.1f", r.turbidityPercent, r.flowRateLMin);
+        break;
+      default:
+        lcd.printf("Lv:%2.0f%% V:%.1fL", r.tankLevelPercent, volumeL);
+        break;
     }
     return;
   }
 
-  // Normal cycling through metrics on line 1
+  if (pendingQueueCount > 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("SYNC SD:");
+    printLcdQueueCount(pendingQueueCount);
+    lcd.setCursor(0, 1);
+    lcd.printf("T:%2.1f pH:%2.1f", r.temperatureC, r.ph);
+    return;
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.printf("Lv:%2.0f%% Vol:%.1fL", r.tankLevelPercent, volumeL);
+
+  if (r.flowRateLMin > 0.2f) {
+    lcd.setCursor(0, 0);
+    lcd.printf("Flow:%2.1fL/m", r.flowRateLMin);
+    return;
+  }
+
   switch (cycleIndex % 2) {
     case 0:
       lcd.setCursor(0, 0);
-      if (isOnline) {
-        lcd.printf("Temp:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
-      } else {
-        lcd.printf("Temp:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
-        lcd.setCursor(14, 0);
-        lcd.print("O");
-      }
+      lcd.printf("Temp:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
       break;
 
     case 1:
       lcd.setCursor(0, 0);
-      if (isOnline) {
-        lcd.printf("Tur:%2.0f%% R:%d", r.turbidityPercent, r.colorR);
-      } else {
-        lcd.printf("Tur:%2.0f%% R:%d", r.turbidityPercent, r.colorR);
-        lcd.setCursor(14, 0);
-        lcd.print("O");
-      }
+      lcd.printf("Tur:%2.0f%% R:%d", r.turbidityPercent, r.colorR);
       break;
   }
 }
@@ -963,10 +1059,14 @@ void setup() {
   lcd.print("Booting...");
 
   ds18b20.begin();
+  ds18b20.setResolution(10);
 
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   sdReady = SD.begin(PIN_SD_CS);
+  pendingQueueCount = countPendingQueueRecords();
+  latestReading.pendingQueueCount = pendingQueueCount;
 
+  WiFi.persistent(false);
   ensureWiFiConnected();
   configTime(2 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // SAST = UTC+2 (South Africa)
   initializePhAutoCalibration();
@@ -974,19 +1074,8 @@ void setup() {
   initializeColorCalibration();
   loadCalibrationState();
 
-  // Wait for sensors to initialize and take first readings
-  Serial.println("Initializing sensors...");
-  delay(2000);  // 2 second delay for sensor stabilization
-  
-  // Take first sensor readings to ensure they're ready
-  bool tempOk, phOk, turbOk, colorOk;
-  float phVolt;
-  readTemperatureC(tempOk);
-  readPh(phOk, phVolt);
-  readTurbidityPercent(turbOk, phVolt);
-  Serial.println("Sensor initialization complete.");
-
   Serial.println("Setup complete.");
+  Serial.printf("SD queue pending: %lu\n", static_cast<unsigned long>(pendingQueueCount));
   Serial.println("Change SERVER_URL to your PC LAN IP before uploading.");
   printCalibrationHelp();
 }
@@ -1022,7 +1111,7 @@ void loop() {
                   tankLevel, latestReading.hasWater ? "YES" : "NO");
   }
 
-  // Telemetry posting every 200ms (faster real-time response)
+  // Telemetry sampling and upload. Offline/dashboard failures are written to SD.
   if (now - lastPostMs >= POST_INTERVAL_MS || lastPostMs == 0) {
     const uint32_t sampleWindowMs = lastPostMs == 0 ? POST_INTERVAL_MS : (now - lastPostMs);
     lastPostMs = now;
@@ -1035,25 +1124,25 @@ void loop() {
 
     logToSd(latestReading, timestamp, recordId);
 
-    // Attempt to flush any pending queued payloads first when online
-    if (WiFi.status() == WL_CONNECTED) {
+    // Backlog is uploaded first. Live records wait in SD until old records are drained.
+    if (pendingQueueCount > 0) {
       tryFlushPendingQueue();
     }
 
-    // Build current telemetry payload and attempt send. If send fails, enqueue to SD for retry.
     String payload;
     buildTelemetryPayload(latestReading, timestamp, recordId, payload);
+
     bool sent = false;
-    if (WiFi.status() == WL_CONNECTED) {
+    if (pendingQueueCount > 0) {
+      if (!enqueuePayloadToSd(payload)) {
+        Serial.println("WARNING: Failed to enqueue payload to SD");
+      }
+    } else if (shouldAttemptDashboardNow()) {
       sent = sendPayloadToDashboard(payload);
-      if (!sent) {
-        // enqueue for later retry
-        if (!enqueuePayloadToSd(payload)) {
-          Serial.println("WARNING: Failed to enqueue payload to SD");
-        }
+      if (!sent && !enqueuePayloadToSd(payload)) {
+        Serial.println("WARNING: Failed to enqueue payload to SD");
       }
     } else {
-      // Offline: persist payload to SD queue for later upload
       if (!enqueuePayloadToSd(payload)) {
         Serial.println("WARNING: SD not ready - cannot queue payload");
       }
@@ -1061,7 +1150,8 @@ void loop() {
 
     Serial.println("=== ESP32 Water Reading ===");
     Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-    Serial.printf("Queue: %u\n", pendingQueueCount);
+    Serial.printf("Dashboard: %s\n", isDashboardOnline() ? "Online" : "Offline");
+    Serial.printf("Queue: %lu\n", static_cast<unsigned long>(pendingQueueCount));
     Serial.printf("Water Present: %s\n", latestReading.hasWater ? "YES" : "NO");
     Serial.printf("Tank: %.1f %%\n", latestReading.tankLevelPercent);
     Serial.printf("Temp: %.2f C (ok=%d)\n", latestReading.temperatureC, latestReading.temperatureSensorOk ? 1 : 0);
@@ -1078,7 +1168,7 @@ void loop() {
       updateLcd(latestReading, lcdCycleIndex);
       lcdCycleIndex++;
       
-      if (lcdCycleIndex >= 2) {  // Only 2 cycles now
+      if (lcdCycleIndex >= 3) {
         tankScanTriggered = false;
         lcdCycleIndex = 0;
       }

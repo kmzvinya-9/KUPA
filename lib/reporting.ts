@@ -54,6 +54,8 @@ type MultiMetricChartConfig = {
   }>
 }
 
+type ChartDefinition = SingleMetricChartConfig | MultiMetricChartConfig
+
 type EmailChartMeta = {
   cid: string
   filename: string
@@ -188,6 +190,137 @@ function createPdfFromPages(pages: string[][]) {
   return Buffer.from(pdf, 'utf8')
 }
 
+function pdfNumber(value: number) {
+  return Number.isFinite(value) ? value.toFixed(2) : '0.00'
+}
+
+function hexToPdfRgb(color: string) {
+  const clean = color.replace('#', '')
+  const r = Number.parseInt(clean.slice(0, 2), 16) || 0
+  const g = Number.parseInt(clean.slice(2, 4), 16) || 0
+  const b = Number.parseInt(clean.slice(4, 6), 16) || 0
+  return `${(r / 255).toFixed(3)} ${(g / 255).toFixed(3)} ${(b / 255).toFixed(3)}`
+}
+
+function pdfText(x: number, y: number, size: number, text: string, color = '#0f172a') {
+  return `q ${hexToPdfRgb(color)} rg BT /F1 ${size} Tf ${pdfNumber(x)} ${pdfNumber(y)} Td (${escapePdfText(text)}) Tj ET Q`
+}
+
+function pdfRect(x: number, y: number, width: number, height: number, color: string) {
+  return `q ${hexToPdfRgb(color)} rg ${pdfNumber(x)} ${pdfNumber(y)} ${pdfNumber(width)} ${pdfNumber(height)} re f Q`
+}
+
+function pdfLine(x1: number, y1: number, x2: number, y2: number, color: string, width = 1) {
+  return `q ${hexToPdfRgb(color)} RG ${pdfNumber(width)} w ${pdfNumber(x1)} ${pdfNumber(y1)} m ${pdfNumber(x2)} ${pdfNumber(y2)} l S Q`
+}
+
+function pdfPolyline(points: Array<{ x: number; y: number }>, color: string, width = 2.2) {
+  if (points.length === 0) return ''
+  if (points.length === 1) {
+    return pdfRect(points[0].x - 2, points[0].y - 2, 4, 4, color)
+  }
+
+  return [
+    `q ${hexToPdfRgb(color)} RG ${pdfNumber(width)} w`,
+    `${pdfNumber(points[0].x)} ${pdfNumber(points[0].y)} m`,
+    ...points.slice(1).map((point) => `${pdfNumber(point.x)} ${pdfNumber(point.y)} l`),
+    'S Q',
+  ].join('\n')
+}
+
+function chartSummary(chart: ChartDefinition) {
+  return 'series' in chart
+    ? `${chart.title}: ${chart.series.map((entry) => buildChartSummary(entry.name, entry.values, chart.unit === ' RGB' ? '' : chart.unit)).join(' ')}`
+    : buildChartSummary(chart.title, chart.values, chart.unit)
+}
+
+function createPdfChartPage(chart: ChartDefinition) {
+  const content: string[] = []
+  const boxX = 36
+  const boxY = 104
+  const boxWidth = 523
+  const boxHeight = 636
+  const plotX = 82
+  const plotY = 230
+  const plotWidth = 430
+  const plotHeight = 360
+  const summary = chartSummary(chart)
+
+  content.push(pdfText(40, 800, 18, chart.title))
+  wrapText(summary, 92).slice(0, 3).forEach((line, index) => {
+    content.push(pdfText(40, 778 - index * 14, 9.5, line, '#475569'))
+  })
+  content.push(pdfRect(boxX, boxY, boxWidth, boxHeight, '#0f172a'))
+  content.push(pdfText(boxX + 24, boxY + boxHeight - 38, 17, chart.title, '#f8fafc'))
+
+  const series = 'series' in chart
+    ? chart.series.filter((entry) => entry.values.length > 0)
+    : [{ name: chart.title, color: chart.color, values: chart.values }]
+  const allValues = series.flatMap((entry) => entry.values)
+
+  if (allValues.length === 0) {
+    content.push(pdfText(boxX + 120, boxY + 330, 15, 'No telemetry available for this date', '#cbd5e1'))
+    return content
+  }
+
+  const minRaw = Math.min(...allValues, ...(!('series' in chart) && chart.normalRange ? [chart.normalRange.low] : []))
+  const maxRaw = Math.max(...allValues, ...(!('series' in chart) && chart.normalRange ? [chart.normalRange.high] : []))
+  const spread = maxRaw - minRaw
+  const padding = spread === 0 ? Math.max(1, Math.abs(maxRaw) * 0.12 || 1) : spread * 0.14
+  const minimum = minRaw - padding
+  const maximum = maxRaw + padding
+  const range = maximum - minimum || 1
+  const longestSeriesLength = Math.max(...series.map((entry) => entry.values.length))
+  const xAt = (index: number, length: number) => plotX + (length <= 1 ? plotWidth / 2 : (index / (length - 1)) * plotWidth)
+  const yAt = (value: number) => plotY + ((value - minimum) / range) * plotHeight
+
+  for (let index = 0; index < 5; index += 1) {
+    const ratio = index / 4
+    const y = plotY + ratio * plotHeight
+    const value = minimum + ratio * range
+    content.push(pdfLine(plotX, y, plotX + plotWidth, y, '#1e293b', 0.8))
+    content.push(pdfText(plotX - 42, y - 3, 8, formatMetricNumber(value), '#94a3b8'))
+  }
+
+  if (!('series' in chart) && chart.normalRange) {
+    const lowY = yAt(chart.normalRange.low)
+    const highY = yAt(chart.normalRange.high)
+    content.push(pdfRect(plotX, lowY, plotWidth, Math.max(1, highY - lowY), '#172554'))
+    content.push(pdfText(plotX + plotWidth - 120, highY + 8, 8, `Normal ${formatMetricNumber(chart.normalRange.low)}-${formatMetricNumber(chart.normalRange.high)}${chart.unit}`, '#93c5fd'))
+  }
+
+  series.forEach((entry) => {
+    const points = entry.values.map((value, index) => ({
+      x: xAt(index, entry.values.length || longestSeriesLength),
+      y: yAt(value),
+    }))
+    content.push(pdfPolyline(points, entry.color, 'series' in chart ? 2 : 2.6))
+    if (points.length <= 90) {
+      points.forEach((point) => {
+        content.push(pdfRect(point.x - 1.6, point.y - 1.6, 3.2, 3.2, entry.color))
+      })
+    }
+  })
+
+  const labels = chart.labels
+  const xLabels = [
+    { label: labels[0] ?? 'Start', x: plotX },
+    { label: labels[Math.floor((labels.length - 1) / 2)] ?? 'Mid', x: plotX + plotWidth / 2 },
+    { label: labels[labels.length - 1] ?? 'End', x: plotX + plotWidth - 42 },
+  ]
+  xLabels.forEach((item) => {
+    content.push(pdfText(item.x, plotY - 24, 8, item.label, '#94a3b8'))
+  })
+
+  series.slice(0, 4).forEach((entry, index) => {
+    const legendX = boxX + 24 + index * 124
+    content.push(pdfRect(legendX, boxY + 38, 16, 4, entry.color))
+    content.push(pdfText(legendX + 22, boxY + 33, 8.5, entry.name.slice(0, 22), '#cbd5e1'))
+  })
+
+  return content
+}
+
 export function createDailyReportPdf(date: string, records: TelemetryRecord[]) {
   const stats = buildDailyReportStats(records)
   const reportLines: string[] = []
@@ -256,6 +389,10 @@ export function createDailyReportPdf(date: string, records: TelemetryRecord[]) {
 
     content.push('ET')
     pages.push(content)
+  }
+
+  for (const chart of buildDailyChartDefinitions(date, records)) {
+    pages.push(createPdfChartPage(chart))
   }
 
   if (pages.length === 0) {
@@ -456,16 +593,31 @@ function buildChartSummary(title: string, values: number[], unit: string) {
   return `${title}: min ${formatMetricNumber(minValue(values))}${unit}, avg ${formatMetricNumber(average(values))}${unit}, max ${formatMetricNumber(maxValue(values))}${unit}.`
 }
 
-export function createInlineEmailCharts(date: string, records: TelemetryRecord[]) {
-  const labels = records.map((record) => formatTimeLabel(record.timestamp))
-  const chartDefinitions: Array<SingleMetricChartConfig | MultiMetricChartConfig> = [
+const MAX_REPORT_CHART_POINTS = 180
+
+function sampleRecordsForCharts(records: TelemetryRecord[]) {
+  if (records.length <= MAX_REPORT_CHART_POINTS) return records
+
+  const indexes = new Set<number>()
+  for (let index = 0; index < MAX_REPORT_CHART_POINTS; index += 1) {
+    indexes.add(Math.round((index * (records.length - 1)) / (MAX_REPORT_CHART_POINTS - 1)))
+  }
+
+  return [...indexes].sort((a, b) => a - b).map((index) => records[index])
+}
+
+function buildDailyChartDefinitions(date: string, records: TelemetryRecord[]): ChartDefinition[] {
+  const chartRecords = sampleRecordsForCharts(records)
+  const labels = chartRecords.map((record) => formatTimeLabel(record.timestamp))
+
+  return [
     {
       cid: `chart-ph-${date}@water-dashboard`,
       filename: `ph-${date}.svg`,
       title: 'pH Trend',
       unit: ' pH',
       color: '#22d3ee',
-      values: records.map((record) => record.ph),
+      values: chartRecords.map((record) => record.ph),
       labels,
       normalRange: { low: 6.5, high: 8.5 },
     },
@@ -475,7 +627,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Temperature Trend',
       unit: ' °C',
       color: '#fb923c',
-      values: records.map((record) => record.temperatureC),
+      values: chartRecords.map((record) => record.temperatureC),
       labels,
     },
     {
@@ -484,7 +636,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Turbidity Trend',
       unit: ' %',
       color: '#a78bfa',
-      values: records.map((record) => record.turbidityPercent),
+      values: chartRecords.map((record) => record.turbidityPercent),
       labels,
     },
     {
@@ -493,7 +645,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Flow Rate Trend',
       unit: ' L/min',
       color: '#34d399',
-      values: records.map((record) => record.flowRateLMin),
+      values: chartRecords.map((record) => record.flowRateLMin),
       labels,
     },
     {
@@ -502,7 +654,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Tank Level Trend',
       unit: ' %',
       color: '#38bdf8',
-      values: records.map((record) => record.tankLevelPercent),
+      values: chartRecords.map((record) => record.tankLevelPercent),
       labels,
     },
     {
@@ -511,7 +663,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Battery Voltage Trend',
       unit: ' V',
       color: '#facc15',
-      values: records.map((record) => record.batteryVoltage),
+      values: chartRecords.map((record) => record.batteryVoltage),
       labels,
       normalRange: { low: 5.5, high: 8.4 },
     },
@@ -521,7 +673,7 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       title: 'Light / Lux Trend',
       unit: ' lx',
       color: '#f472b6',
-      values: records.map((record) => record.lux),
+      values: chartRecords.map((record) => record.lux),
       labels,
     },
     {
@@ -531,9 +683,9 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       unit: ' RGB',
       labels,
       series: [
-        { name: 'Red channel', color: '#ef4444', values: records.map((record) => record.colorR) },
-        { name: 'Green channel', color: '#22c55e', values: records.map((record) => record.colorG) },
-        { name: 'Blue channel', color: '#3b82f6', values: records.map((record) => record.colorB) },
+        { name: 'Red channel', color: '#ef4444', values: chartRecords.map((record) => record.colorR) },
+        { name: 'Green channel', color: '#22c55e', values: chartRecords.map((record) => record.colorG) },
+        { name: 'Blue channel', color: '#3b82f6', values: chartRecords.map((record) => record.colorB) },
       ],
     },
     {
@@ -543,11 +695,15 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       unit: ' V',
       labels,
       series: [
-        { name: 'pH probe voltage', color: '#06b6d4', values: records.map((record) => record.phVoltage) },
-        { name: 'Turbidity sensor voltage', color: '#e879f9', values: records.map((record) => record.turbidityVoltage) },
+        { name: 'pH probe voltage', color: '#06b6d4', values: chartRecords.map((record) => record.phVoltage) },
+        { name: 'Turbidity sensor voltage', color: '#e879f9', values: chartRecords.map((record) => record.turbidityVoltage) },
       ],
     },
   ]
+}
+
+export function createInlineEmailCharts(date: string, records: TelemetryRecord[]) {
+  const chartDefinitions = buildDailyChartDefinitions(date, records)
 
   const attachments: InlineEmailAttachment[] = []
   const charts: EmailChartMeta[] = []
@@ -565,25 +721,21 @@ export function createInlineEmailCharts(date: string, records: TelemetryRecord[]
       contentDisposition: 'inline',
     })
 
-    const summary = 'series' in chart
-      ? `${chart.title}: ${chart.series.map((entry) => buildChartSummary(entry.name, entry.values, chart.unit === ' RGB' ? '' : chart.unit)).join(' ')}`
-      : buildChartSummary(chart.title, chart.values, chart.unit)
-
     charts.push({
       cid: chart.cid,
       filename: chart.filename,
       title: chart.title,
-      summary,
+      summary: chartSummary(chart),
     })
   }
 
   return { attachments, charts }
 }
 
-export function createDailyReportEmailHtml(date: string, records: TelemetryRecord[]) {
+export function createDailyReportEmailHtml(date: string, records: TelemetryRecord[], providedCharts?: EmailChartMeta[]) {
   const stats = buildDailyReportStats(records)
   const lastRecord = records[records.length - 1] ?? null
-  const { charts } = createInlineEmailCharts(date, records)
+  const charts = providedCharts ?? createInlineEmailCharts(date, records).charts
   const statusPills = [
     `Records: ${stats.count}`,
     `No-water points: ${stats.noWaterCount}`,
@@ -597,7 +749,7 @@ export function createDailyReportEmailHtml(date: string, records: TelemetryRecor
       <div style="background:#0f172a;border:1px solid #1e293b;border-radius:20px;padding:24px 28px;box-shadow:0 10px 30px rgba(15,23,42,.35);">
         <p style="margin:0 0 8px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#38bdf8;">Water dashboard automatic report</p>
         <h1 style="margin:0 0 10px;font-size:28px;line-height:1.2;color:#f8fafc;">Daily sensor graphs for ${escapeHtml(formatReportDate(date))}</h1>
-        <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#cbd5e1;">This email includes inline graphs for the stored telemetry on the selected day. The PDF summary is also attached for download and sharing.</p>
+        <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#cbd5e1;">This email includes inline graphs for the stored telemetry on the selected day. The attached PDF contains the same chart set for download and sharing.</p>
         <div style="margin:0 0 20px;">
           ${statusPills.map((item) => `<span style="display:inline-block;margin:0 8px 8px 0;padding:8px 12px;border-radius:999px;background:#111827;border:1px solid #334155;font-size:12px;color:#e2e8f0;">${escapeHtml(item)}</span>`).join('')}
         </div>

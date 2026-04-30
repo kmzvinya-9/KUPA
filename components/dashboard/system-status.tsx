@@ -22,6 +22,7 @@ interface SystemStatusProps {
   sdCardActive?: boolean
   sdCardWriting?: boolean
   sdCardUsage?: number
+  pendingQueueCount?: number
 }
 
 export function SystemStatus({
@@ -33,6 +34,7 @@ export function SystemStatus({
   sdCardActive = true,
   sdCardWriting = false,
   sdCardUsage = 45,
+  pendingQueueCount = 0,
 }: SystemStatusProps) {
   const modeLabels = {
     active: "Active Monitoring",
@@ -141,6 +143,10 @@ export function SystemStatus({
                 <span className="text-muted-foreground">Storage Used</span>
                 <span className="font-mono text-foreground">{sdCardUsage}%</span>
               </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-muted-foreground">Pending Uploads</span>
+                <span className="font-mono text-foreground">{pendingQueueCount}</span>
+              </div>
               <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
                 <div
                   className={cn(
@@ -156,6 +162,11 @@ export function SystemStatus({
                   <>
                     <Save className="h-3 w-3 animate-pulse text-warning" />
                     <span>Writing live data...</span>
+                  </>
+                ) : pendingQueueCount > 0 ? (
+                  <>
+                    <Activity className="h-3 w-3 animate-pulse text-warning" />
+                    <span>Uploading stored data first</span>
                   </>
                 ) : (
                   <>

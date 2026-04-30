@@ -31,16 +31,14 @@ function getSmtpConfig() {
   return { host, port, secure, user, pass, from }
 }
 
-async function sendWithNodemailer(email: string, date: string, pdfBuffer: Buffer) {
-  const smtp = getSmtpConfig()
-
+async function sendWithNodemailer(email: string, date: string, records: ReturnType<typeof getTelemetryRecordsForDate>, smtp = getSmtpConfig()) {
   if (!smtp) {
     return { emailed: false, emailConfigured: false }
   }
 
-  const records = getTelemetryRecordsForDate(date)
-  const html = createDailyReportEmailHtml(date, records)
-  const { attachments: chartAttachments } = createInlineEmailCharts(date, records)
+  const { attachments: chartAttachments, charts } = createInlineEmailCharts(date, records)
+  const html = createDailyReportEmailHtml(date, records, charts)
+  const pdfBuffer = createDailyReportPdf(date, records)
 
   const transporter = nodemailer.createTransport({
     host: smtp.host,
@@ -60,7 +58,7 @@ async function sendWithNodemailer(email: string, date: string, pdfBuffer: Buffer
       `Water dashboard report for ${date}.`,
       `Records included: ${records.length}.`,
       'The HTML version of this email contains inline graphs for pH, temperature, turbidity, flow, tank level, battery voltage, lux, RGB color channels, and sensor diagnostic voltages.',
-      'A PDF summary is attached as well.',
+      'The attached PDF contains the same graph set.',
     ].join('\n'),
     html,
     attachments: [
@@ -111,16 +109,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: false, message: 'Enter a valid email address.' }, { status: 400 })
     }
 
-    const records = getTelemetryRecordsForDate(date)
-    const pdfBuffer = createDailyReportPdf(date, records)
-    const emailResult = await sendWithNodemailer(email, date, pdfBuffer)
+    const smtp = getSmtpConfig()
 
-    if (emailResult.emailed) {
+    if (smtp) {
+      void Promise.resolve()
+        .then(() => sendWithNodemailer(email, date, getTelemetryRecordsForDate(date), smtp))
+        .catch((error) => {
+          console.error('Report email failed:', error)
+        })
+
       return NextResponse.json({
         ok: true,
         emailed: true,
+        queued: true,
         emailConfigured: true,
-        message: `Graph report sent to ${email}.`,
+        message: `Graph report is being sent to ${email}.`,
         downloadUrl: `/api/system-alerts/report?date=${encodeURIComponent(date)}`,
       })
     }
@@ -129,7 +132,7 @@ export async function POST(request: Request) {
       ok: true,
       emailed: false,
       emailConfigured: false,
-      message: 'The PDF report is ready. Set SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, and MAIL_FROM on the dashboard server to email the inline sensor graphs with Nodemailer.',
+      message: 'The chart PDF is ready. Set SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, and MAIL_FROM on the dashboard server to email the inline sensor graphs with Nodemailer.',
       downloadUrl: `/api/system-alerts/report?date=${encodeURIComponent(date)}`,
     })
   } catch (error) {

@@ -42,6 +42,7 @@ type TelemetryReading = {
   sdCardWriting: boolean
   sdCardUsage: number
   uptimeSeconds: number
+  pendingQueueCount: number
   temperatureSensorOk: boolean
   phSensorOk: boolean
   turbiditySensorOk: boolean
@@ -111,6 +112,7 @@ const EMPTY_READING: TelemetryReading = {
   sdCardWriting: false,
   sdCardUsage: 0,
   uptimeSeconds: 0,
+  pendingQueueCount: 0,
   temperatureSensorOk: false,
   phSensorOk: false,
   turbiditySensorOk: false,
@@ -558,6 +560,7 @@ function formatUptime(totalSeconds: number) {
 
 export function DashboardPage() {
   const [isConnected, setIsConnected] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<string | null>(null)
   const [reading, setReading] = useState<TelemetryReading>(EMPTY_READING)
   const [phHistory, setPhHistory] = useState<DataPoint[]>([])
@@ -619,8 +622,10 @@ export function DashboardPage() {
           deviceId: payload.reading.deviceId || EMPTY_READING.deviceId,
           tankCapacity: payload.reading.tankCapacity || 100,
           sdCardActive: payload.reading.sdCardActive,
+          sdCardWriting: payload.reading.sdCardWriting,
           sdCardUsage: payload.reading.sdCardUsage,
           uptimeSeconds: payload.reading.uptimeSeconds,
+          pendingQueueCount: payload.reading.pendingQueueCount,
           temperatureSensorOk: payload.reading.temperatureSensorOk,
           phSensorOk: payload.reading.phSensorOk,
           turbiditySensorOk: payload.reading.turbiditySensorOk,
@@ -682,6 +687,16 @@ export function DashboardPage() {
       applyLatest({ connected: false, staleAfterMs: 15000, reading: EMPTY_READING })
     }
   }, [applyLatest])
+
+  const refreshDashboard = useCallback(async () => {
+    setIsRefreshing(true)
+    try {
+      await loadHistory()
+      await fetchLatest()
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [fetchLatest, loadHistory])
 
   useEffect(() => {
     void loadHistory()
@@ -789,7 +804,8 @@ export function DashboardPage() {
         <DashboardHeader
           isConnected={isConnected}
           lastUpdate={lastUpdate}
-          onRefresh={() => void fetchLatest()}
+          onRefresh={() => void refreshDashboard()}
+          isRefreshing={isRefreshing}
         />
 
       <main className="container mx-auto px-4 py-6">
@@ -871,6 +887,7 @@ export function DashboardPage() {
                 sdCardActive={reading.sdCardActive}
                 sdCardWriting={reading.sdCardWriting}
                 sdCardUsage={reading.sdCardUsage}
+                pendingQueueCount={reading.pendingQueueCount}
               />
             </div>
           </TabsContent>
@@ -936,6 +953,10 @@ export function DashboardPage() {
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
+                    <span className="text-sm text-muted-foreground">Pending SD Uploads</span>
+                    <span className="text-sm font-mono text-foreground">{reading.pendingQueueCount}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Storage Used</span>
                     <span className="text-sm font-mono text-foreground">{reading.sdCardUsage.toFixed(1)}%</span>
                   </div>
@@ -956,7 +977,7 @@ export function DashboardPage() {
                     </div>
                     <div className="rounded bg-secondary/50 p-2">
                       <p className="text-muted-foreground">Log Interval</p>
-                      <p className="font-mono text-foreground">2 sec real-time</p>
+                      <p className="font-mono text-foreground">500 ms sample</p>
                     </div>
                   </div>
                 </div>

@@ -4,7 +4,7 @@
 
 ### **Changes Implemented:**
 1. **LCD Cycle 2 Bug Fixed** - Both cycles now display properly (Temp/pH AND Turbidity/Color)
-2. **Reduced Delays** - All sensor updates now at 200ms (5 times per second)
+2. **Reduced Delays** - ESP32 sampling runs every 500ms, with fast tank scanning and non-blocking offline upload
 3. **API Key Configuration** - Created `.env.local` for proper authentication
 4. **Network Configuration** - ESP32 configured to send to `192.168.1.142:3000`
 5. **All Comments Updated** - Code comments now match actual values
@@ -72,7 +72,7 @@ Flow: X.XX L/min (idle/active)
 #### Check Dashboard:
 1. Open browser to `http://localhost:3000`
 2. Look for **"Connected"** status in the header
-3. Sensor readings should update every 200ms
+3. Sensor readings should update from the dashboard poll, while the ESP32 samples every 500ms
 4. LCD should cycle between:
    - **Cycle 0**: Temperature and pH
    - **Cycle 1**: Turbidity and Color (R value)
@@ -104,7 +104,7 @@ Flow: X.XX L/min (idle/active)
 3. **Calibration needed** - Use serial commands to calibrate sensors
 
 ### **Issue: Readings are slow or delayed**
-**Solution:** The delay is now 200ms. If still slow:
+**Solution:** Sensor sampling is 500ms and dashboard polling is 2 seconds. If still slow:
 1. Check Wi-Fi signal strength
 2. Ensure no network congestion
 3. Verify ESP32 isn't in WiFi retry mode
@@ -115,7 +115,7 @@ Flow: X.XX L/min (idle/active)
 
 ### **Dashboard Display:**
 - **Connection Status**: "Connected" (green dot)
-- **Update Frequency**: Every 200ms
+- **Update Frequency**: ESP32 samples every 500ms; dashboard polls every 2 seconds
 - **Charts**: Real-time updates with 5-minute buckets
 - **Alerts**: Automatic detection of anomalies
 
@@ -125,6 +125,7 @@ Flow: X.XX L/min (idle/active)
 POST /api/ingest -> 200
 === ESP32 Water Reading ===
 WiFi: Connected
+Dashboard: Online
 Queue: 0
 Water Present: YES
 Tank: 45.2 %
@@ -135,9 +136,17 @@ Flow: 0.00 L/min (idle)
 ```
 
 ### **LCD Display Cycling:**
-- **1.5 seconds**: Temperature and pH
-- **1.5 seconds**: Turbidity and Color (R value)
-- **Repeats**
+- **Online**: Temperature/pH, turbidity/color, flow when active, and tank level/volume
+- **Dashboard offline**: First line shows `OFFLINE SD:####`; second line continues cycling live sensor readings
+- **Reconnected with stored data**: First line shows `SYNC SD:####` while SD records upload before live records
+
+---
+
+## Offline SD Recovery
+
+If Wi-Fi or the dashboard API is unavailable, the ESP32 continues reading sensors and writes each telemetry payload to `/pending_queue.jsonl` on the SD card. When the dashboard is reachable again, queued SD records are uploaded first in small batches; current live readings are held in the same queue until the older offline records have been accepted.
+
+This keeps LCD and sensor response real-time while still preserving record order for the dashboard history.
 
 ---
 
@@ -218,4 +227,4 @@ If you encounter any issues:
 3. Verify network connectivity between ESP32 and computer
 4. Ensure firewall allows connections on port 3000
 
-**All bugs have been fixed and delays reduced to 200ms for real-time performance!**
+**Offline SD buffering, fast startup, and real-time sensor/LCD response are enabled.**
