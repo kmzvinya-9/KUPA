@@ -94,6 +94,23 @@ Flow: X.XX L/min (idle/active)
 3. Ensure dashboard is running on port 3000
 4. Check firewall isn't blocking port 3000
 
+### **Issue: Next.js crashes with `CPU doesn't support the bmi2 instructions`**
+**Cause:** That crash comes from Turbopack on older CPUs. It is not caused by the dashboard application code.
+
+**Solution:** This repo now starts Next.js with Webpack by default:
+- `npm run dev`
+- `npm run build`
+
+If someone runs `next dev` or `next build` manually on Next.js 16, Turbopack may still be used and can crash on that machine. Use the npm scripts above instead.
+
+### **Issue: `Slow filesystem detected` warning**
+**Cause:** This is a performance warning, not a dashboard code failure. It is common on Windows when the project lives in a slow Desktop, synced folder, antivirus-scanned folder, or network-backed location.
+
+**Ways to improve it:**
+1. Move the project to a fast local folder such as `C:\dev\IOT_residue_dashboard_ready`
+2. Delete the `.next` folder after moving
+3. Avoid OneDrive/network folders for development if possible
+
 ### **Issue: LCD only shows Cycle 0 (Temp/pH), not Cycle 1**
 **Solution:** This bug is now fixed! Re-upload the updated ESP32 code.
 
