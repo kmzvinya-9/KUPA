@@ -1,0 +1,33 @@
+{
+    "configurations": [
+        {
+            "name": "ESP32",
+            "compilerPath": "pio run -t clean",
+            "cStandard": "gnu17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "gcc-arm",
+            "defines": [
+                "ARDUINO=10805",
+                "ARDUINO_ARCH_ESP32",
+                "ESP32",
+                "F_CPU=240000000L"
+            ],
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${env:HOME}/.platformio/packages/framework-arduinoespressif32/cores/esp32/**",
+                "${env:HOME}/.platformio/packages/framework-arduinoespressif32/libraries/**",
+                "${env:HOME}/.platformio/packages/toolchain-xtensa-esp32/xtensa-esp32-elf/include/**",
+                "${env:HOME}/.platformio/packages/toolchain-xtensa-esp32/xtensa-esp32-elf/include/c++/**"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/**",
+                    "${env:HOME}/.platformio/packages/framework-arduinoespressif32/cores/esp32/**"
+                ],
+                "limitSymbolsToIncludedHeaders": false
+            }
+        }
+    ],
+    "version": 4,
+    "enableConfigurationSquiggles": false
+}
