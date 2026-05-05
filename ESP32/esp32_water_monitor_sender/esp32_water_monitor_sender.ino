@@ -57,12 +57,16 @@ constexpr float TANK_USABLE_CAPACITY_L = 5.0f;      // 5L capacity
 constexpr float FLOW_HZ_PER_L_MIN = 7.5f;
 constexpr uint32_t POST_INTERVAL_MS = 500;          // 500ms live sampling with SD fallback
 constexpr uint32_t TANK_SCAN_INTERVAL_MS = 50;      // Tank level scanned every 50ms for fast detection
+constexpr uint32_t LCD_REFRESH_INTERVAL_MS = 300;   // LCD refresh for status blinking without flicker
 constexpr uint32_t LCD_CYCLE_INTERVAL_MS = 1500;    // LCD cycles through readings every 1.5 seconds
 constexpr uint32_t WIFI_RETRY_MS = 5000;            // Non-blocking WiFi retry cadence
 constexpr uint32_t DASHBOARD_RETRY_MS = 3000;       // Avoid blocking every loop when dashboard is down
-constexpr uint32_t QUEUE_FLUSH_INTERVAL_MS = 250;   // Small SD upload slices keep readings responsive
-constexpr uint8_t QUEUE_FLUSH_MAX_RECORDS = 3;
+constexpr uint32_t QUEUE_FLUSH_INTERVAL_MS = 350;   // Small SD upload slices keep readings responsive
+constexpr uint8_t QUEUE_FLUSH_MAX_RECORDS = 1;
 constexpr uint16_t HTTP_TIMEOUT_MS = 900;
+constexpr uint32_t TEMPERATURE_CONVERSION_MS = 200;
+constexpr uint32_t STATUS_LOG_INTERVAL_MS = 2000;
+constexpr uint32_t SD_SYNC_BLINK_INTERVAL_MS = 300;
 constexpr float ADC_VREF = 3.3f;
 constexpr float TURBIDITY_VREF = 3.3f;
 constexpr float TURBIDITY_CLEAR_V = TURBIDITY_VREF;
@@ -76,10 +80,11 @@ constexpr float PH_STABLE_DELTA = 0.12f;
 constexpr uint8_t ULTRASONIC_BURST_SAMPLES = 5;
 constexpr unsigned long ULTRASONIC_TIMEOUT_US = 5000UL;
 constexpr float ULTRASONIC_SMOOTHING_ALPHA = 0.85f;
-constexpr unsigned long COLOR_PULSE_TIMEOUT_US = 25000UL;
+constexpr unsigned long COLOR_PULSE_TIMEOUT_US = 60000UL;
 constexpr float COLOR_BASELINE_ALPHA = 0.02f;
 constexpr int COLOR_BALANCE_TOLERANCE = 24;
 constexpr int COLOR_BASELINE_MIN = 40;
+constexpr float FLOW_INVALID_READING_L_MIN = 199.5f;
 constexpr uint32_t SERIAL_BAUD_RATE = 115200;
 const char* SD_LOG_FILE = "/water_log.csv";
 const char* SD_QUEUE_FILE = "/pending_queue.jsonl";
@@ -106,6 +111,7 @@ struct Reading {
   uint32_t pulseCount;
   bool sdCardActive;
   bool sdCardWriting;
+  bool sdCardSyncing;
   float sdCardUsage;
   uint32_t uptimeSeconds;
   uint32_t pendingQueueCount;
@@ -123,12 +129,13 @@ Reading latestReading{};
 bool sdReady = false;
 uint32_t lastPostMs = 0;
 uint32_t lastLcdMs = 0;
+uint32_t lastLcdCycleMs = 0;
 uint32_t lastTankScanMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastDashboardAttemptMs = 0;
 uint32_t lastQueueFlushMs = 0;
+uint32_t lastStatusLogMs = 0;
 uint8_t lcdCycleIndex = 0;
-bool tankScanTriggered = false;
 bool wifiConnectStarted = false;
 bool dashboardReachable = false;
 float phCalibrationOffset = PH_NEUTRAL_DEFAULT;
@@ -147,8 +154,17 @@ uint32_t pendingQueueCount = 0;
 uint32_t pendingQueueOffset = 0;
 uint32_t recordCounter = 0;
 uint32_t bootId = 0;
+bool temperatureRequestInFlight = false;
+bool cachedTemperatureOk = false;
+float cachedTemperatureC = 0.0f;
+uint32_t lastTemperatureRequestMs = 0;
+bool sdSyncBlinkVisible = false;
+uint32_t lastSdBlinkToggleMs = 0;
+char lcdLastLine0[17] = "";
+char lcdLastLine1[17] = "";
 
 void readRawColorSensor(int &r, int &g, int &b, bool &sensorOk);
+void serviceTemperatureSensor();
 
 void IRAM_ATTR onFlowPulse() {
   flowPulses++;
@@ -446,25 +462,48 @@ void handleCalibrationCommand(String command) {
   printCalibrationStatus();
 }
 
-float readTemperatureC(bool &sensorOk) {
+void serviceTemperatureSensor() {
+  if (!latestReading.hasWater) {
+    temperatureRequestInFlight = false;
+    cachedTemperatureOk = false;
+    cachedTemperatureC = 0.0f;
+    return;
+  }
+
+  if (!temperatureRequestInFlight) {
+    ds18b20.requestTemperatures();
+    temperatureRequestInFlight = true;
+    lastTemperatureRequestMs = millis();
+    return;
+  }
+
+  if (millis() - lastTemperatureRequestMs < TEMPERATURE_CONVERSION_MS) {
+    return;
+  }
+
   float total = 0.0f;
   int ok = 0;
 
-  ds18b20.requestTemperatures();
-  delay(50);
-  
   for (int i = 0; i < 2; i++) {
-    float temp = ds18b20.getTempCByIndex(0);
+    const float temp = ds18b20.getTempCByIndex(0);
     if (temp != DEVICE_DISCONNECTED_C && temp > -50.0f && temp < 125.0f) {
       total += temp;
       ok++;
     }
-    delay(5);
   }
 
-  sensorOk = ok > 0;
-  if (!sensorOk) return 0.0f;
-  return (total / ok) + TEMPERATURE_OFFSET_C;
+  cachedTemperatureOk = ok > 0;
+  if (cachedTemperatureOk) {
+    cachedTemperatureC = (total / ok) + TEMPERATURE_OFFSET_C;
+  }
+
+  ds18b20.requestTemperatures();
+  lastTemperatureRequestMs = millis();
+}
+
+float readTemperatureC(bool &sensorOk) {
+  sensorOk = cachedTemperatureOk;
+  return sensorOk ? cachedTemperatureC : 0.0f;
 }
 
 float readPh(bool &sensorOk, float &voltageOut) {
@@ -491,7 +530,7 @@ float readPh(bool &sensorOk, float &voltageOut) {
 
 float readTurbidityPercent(bool &sensorOk, float &voltageOut) {
   voltageOut = readTrimmedAnalogVoltage(PIN_TURBIDITY, 12, 1);
-  sensorOk = voltageOut > 0.02f;
+  sensorOk = voltageOut > 0.005f;
   const float span = max(0.01f, turbidityClearVoltage - turbidityDirtyVoltage);
   float percent = ((voltageOut - turbidityDirtyVoltage) / span) * 100.0f;
   return clampf(percent, 0.0f, 100.0f);
@@ -526,7 +565,7 @@ float readDistanceCm(bool &sensorOk) {
   }
 
   if (validCount == 0) {
-    sensorOk = ultrasonicHasLastValue;
+    sensorOk = false;
     return ultrasonicHasLastValue ? lastDistanceCm : TANK_TOTAL_HEIGHT_CM;
   }
 
@@ -566,21 +605,35 @@ uint32_t readColorPulse(bool s2, bool s3) {
   return pulseIn(PIN_TCS_OUT, LOW, COLOR_PULSE_TIMEOUT_US);
 }
 
-int pulseToColor(uint32_t pulse) {
-  if (pulse == 0) return 0;
-  long mapped = map((long)constrain((int)pulse, 20, 300), 20, 300, 255, 0);
-  return constrain((int)mapped, 0, 255);
-}
-
 void readRawColorSensor(int &r, int &g, int &b, bool &sensorOk) {
   uint32_t pulseR = readColorPulse(LOW, LOW);
   uint32_t pulseG = readColorPulse(HIGH, HIGH);
   uint32_t pulseB = readColorPulse(LOW, HIGH);
 
   sensorOk = pulseR > 0 || pulseG > 0 || pulseB > 0;
-  r = pulseToColor(pulseR);
-  g = pulseToColor(pulseG);
-  b = pulseToColor(pulseB);
+  if (!sensorOk) {
+    r = 0;
+    g = 0;
+    b = 0;
+    return;
+  }
+
+  const float strengthR = pulseR > 0 ? 1000000.0f / pulseR : 0.0f;
+  const float strengthG = pulseG > 0 ? 1000000.0f / pulseG : 0.0f;
+  const float strengthB = pulseB > 0 ? 1000000.0f / pulseB : 0.0f;
+  const float strongest = max(strengthR, max(strengthG, strengthB));
+
+  if (strongest <= 0.0f) {
+    sensorOk = false;
+    r = 0;
+    g = 0;
+    b = 0;
+    return;
+  }
+
+  r = constrain((int)roundf((strengthR / strongest) * 255.0f), 0, 255);
+  g = constrain((int)roundf((strengthG / strongest) * 255.0f), 0, 255);
+  b = constrain((int)roundf((strengthB / strongest) * 255.0f), 0, 255);
 }
 
 void readColorSensor(int &r, int &g, int &b, int &lux, bool &sensorOk, bool hasWater) {
@@ -589,18 +642,21 @@ void readColorSensor(int &r, int &g, int &b, int &lux, bool &sensorOk, bool hasW
   int rawB = 0;
   readRawColorSensor(rawR, rawG, rawB, sensorOk);
 
-  updateColorBaseline(rawR, rawG, rawB, hasWater, sensorOk);
-
-  r = colorBaselineReady ? normalizeColorChannel(rawR, colorBaselineR) : rawR;
-  g = colorBaselineReady ? normalizeColorChannel(rawG, colorBaselineG) : rawG;
-  b = colorBaselineReady ? normalizeColorChannel(rawB, colorBaselineB) : rawB;
+  (void)hasWater;
+  r = rawR;
+  g = rawG;
+  b = rawB;
   lux = constrain((r + g + b) / 3, 0, 255) * 4;
 }
 
 float pulsesToFlowRateLMin(uint32_t pulses, uint32_t sampleWindowMs) {
-  if (sampleWindowMs == 0) return 0.0f;
+  if (sampleWindowMs == 0 || pulses == 0) return 0.0f;
   const float frequencyHz = (pulses * 1000.0f) / sampleWindowMs;
-  return clampf(frequencyHz / FLOW_HZ_PER_L_MIN, 0.0f, 200.0f);
+  const float flowRate = clampf(frequencyHz / FLOW_HZ_PER_L_MIN, 0.0f, 200.0f);
+  if (!isfinite(flowRate) || flowRate >= FLOW_INVALID_READING_L_MIN) {
+    return 0.0f;
+  }
+  return flowRate;
 }
 
 float computeSdUsagePercent() {
@@ -663,6 +719,59 @@ void zeroReading(Reading &r) {
   r.flowSensorState = "no_water";
 }
 
+bool isQueueSyncActive() {
+  return pendingQueueCount > 0 && isDashboardOnline();
+}
+
+void writeLcdRow(uint8_t row, const char *text) {
+  char padded[17];
+  snprintf(padded, sizeof(padded), "%-16.16s", text);
+
+  char *cache = row == 0 ? lcdLastLine0 : lcdLastLine1;
+  if (strncmp(cache, padded, 16) == 0) return;
+
+  lcd.setCursor(0, row);
+  lcd.print(padded);
+  strncpy(cache, padded, sizeof(padded));
+  cache[16] = '\0';
+}
+
+bool shouldBlinkSdSync(bool syncActive) {
+  if (!syncActive) {
+    sdSyncBlinkVisible = false;
+    lastSdBlinkToggleMs = 0;
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (lastSdBlinkToggleMs == 0 || now - lastSdBlinkToggleMs >= SD_SYNC_BLINK_INTERVAL_MS) {
+    sdSyncBlinkVisible = !sdSyncBlinkVisible;
+    lastSdBlinkToggleMs = now;
+  }
+
+  return sdSyncBlinkVisible;
+}
+
+void buildMetricLine(const Reading &r, uint8_t cycleIndex, char *lineOut) {
+  switch (cycleIndex % 3) {
+    case 0:
+      snprintf(lineOut, 17, "T%.1fC pH%.1f", r.temperatureC, r.ph);
+      break;
+    case 1:
+      snprintf(lineOut, 17, "Tb%.0f%% F%.1f", r.turbidityPercent, r.flowRateLMin);
+      break;
+    default:
+      snprintf(lineOut, 17, "R%d G%d B%d", r.colorR, r.colorG, r.colorB);
+      break;
+  }
+}
+
+void buildStatusLine(const Reading &r, bool showSyncFlash, char *lineOut) {
+  (void)showSyncFlash;
+  const float volumeL = r.tankCapacity * (r.tankLevelPercent / 100.0f);
+  snprintf(lineOut, 17, "Lv%.0f%% %.1fL", r.tankLevelPercent, volumeL);
+}
+
 
 String buildTimestamp() {
   time_t now = time(nullptr);
@@ -702,6 +811,7 @@ void buildTelemetryPayload(const Reading &r, const String &timestamp, const Stri
   doc["pulseCount"] = r.pulseCount;
   doc["sdCardActive"] = r.sdCardActive;
   doc["sdCardWriting"] = r.sdCardWriting;
+  doc["sdCardSyncing"] = r.sdCardSyncing;
   doc["sdCardUsage"] = r.sdCardUsage;
   doc["uptimeSeconds"] = r.uptimeSeconds;
   doc["pendingQueueCount"] = r.pendingQueueCount;
@@ -716,18 +826,9 @@ void buildTelemetryPayload(const Reading &r, const String &timestamp, const Stri
 
   // Clear output string first
   bodyOut = "";
-  
-  // Serialize JSON
-  size_t jsonSize = serializeJson(doc, bodyOut);
-  
-  // Debug: Log payload size and first few bytes
-  if (jsonSize == 0) {
+
+  if (serializeJson(doc, bodyOut) == 0) {
     Serial.println("WARNING: JSON serialization produced empty output");
-  } else if (bodyOut.length() == 0) {
-    Serial.println("WARNING: bodyOut string is empty after serialization");
-  } else {
-    // Log payload preview for debugging (first 100 chars)
-    Serial.printf("[PAYLOAD] Size: %d bytes, Preview: %.100s\n", jsonSize, bodyOut.c_str());
   }
 }
 
@@ -815,11 +916,14 @@ void clearPendingQueueIfComplete(size_t queueFileSize) {
 }
 
 void tryFlushPendingQueue() {
+  latestReading.sdCardSyncing = isQueueSyncActive();
   if (!sdReady) return;
   if (pendingQueueCount == 0) return;
   if (!SD.exists(SD_QUEUE_FILE)) {
     pendingQueueOffset = 0;
     pendingQueueCount = 0;
+    latestReading.pendingQueueCount = 0;
+    latestReading.sdCardSyncing = false;
     return;
   }
   if (!shouldAttemptDashboardNow()) return;
@@ -874,6 +978,7 @@ void tryFlushPendingQueue() {
 
   src.close();
   clearPendingQueueIfComplete(queueFileSize);
+  latestReading.sdCardSyncing = isQueueSyncActive();
 }
 
 
@@ -882,6 +987,7 @@ void collectNonTankReadings(Reading &r, uint32_t sampleWindowMs) {
   r.pendingQueueCount = pendingQueueCount;
   r.sdCardActive = sdReady;
   r.sdCardWriting = false;
+  r.sdCardSyncing = isQueueSyncActive();
   r.sdCardUsage = computeSdUsagePercent();
   r.tankCapacity = TANK_USABLE_CAPACITY_L;
 
@@ -892,27 +998,31 @@ void collectNonTankReadings(Reading &r, uint32_t sampleWindowMs) {
   flowPulses = 0;
   interrupts();
 
+  r.temperatureC = readTemperatureC(r.temperatureSensorOk);
+  r.flowRateLMin = pulsesToFlowRateLMin(pulses, sampleWindowMs);
+  r.pulseCount = pulses;
+
   if (!r.hasWater) {
-    r.temperatureSensorOk = true;
-    r.phSensorOk = true;
-    r.turbiditySensorOk = true;
-    r.colorSensorOk = true;
-    zeroReading(r);
-    r.sdCardActive = sdReady;
-    r.sdCardUsage = computeSdUsagePercent();
-    r.uptimeSeconds = millis() / 1000UL;
-    r.pendingQueueCount = pendingQueueCount;
-    r.tankLevelPercent = 0;
-    r.hasWater = false;
+    r.ph = 0.0f;
+    r.turbidityPercent = 0.0f;
+    r.colorR = 0;
+    r.colorG = 0;
+    r.colorB = 0;
+    r.lux = 0;
+    r.phVoltage = 0.0f;
+    r.turbidityVoltage = 0.0f;
+    r.phSensorOk = false;
+    r.turbiditySensorOk = false;
+    r.colorSensorOk = false;
+    r.flowRateLMin = 0.0f;
+    r.pulseCount = 0;
+    r.flowSensorState = "no_water";
     return;
   }
 
-  r.temperatureC = readTemperatureC(r.temperatureSensorOk);
   r.ph = readPh(r.phSensorOk, r.phVoltage);
   updatePhAutoCalibration(r.phVoltage, r.ph, r.hasWater, r.phSensorOk);
   r.turbidityPercent = readTurbidityPercent(r.turbiditySensorOk, r.turbidityVoltage);
-  r.flowRateLMin = pulsesToFlowRateLMin(pulses, sampleWindowMs);
-  r.pulseCount = pulses;
   r.flowSensorState = r.flowRateLMin > 0.2f ? "active" : "idle";
   readColorSensor(r.colorR, r.colorG, r.colorB, r.lux, r.colorSensorOk, r.hasWater);
 }
@@ -960,65 +1070,15 @@ void logToSd(const Reading &r, const String &timestamp, const String &recordId) 
   latestReading.sdCardWriting = false;
 }
 
-void printLcdQueueCount(uint32_t count) {
-  const uint32_t shown = count > 9999UL ? 9999UL : count;
-  lcd.printf("%4lu", static_cast<unsigned long>(shown));
-}
-
 void updateLcd(const Reading &r, uint8_t cycleIndex) {
-  lcd.clear();
+  char line0[17];
+  char line1[17];
+  const bool showSyncFlash = shouldBlinkSdSync(r.sdCardSyncing);
 
-  float volumeL = r.tankCapacity * (r.tankLevelPercent / 100.0f);
-
-  if (!isDashboardOnline()) {
-    lcd.setCursor(0, 0);
-    lcd.print("OFFLINE SD:");
-    printLcdQueueCount(pendingQueueCount);
-
-    lcd.setCursor(0, 1);
-    switch (cycleIndex % 3) {
-      case 0:
-        lcd.printf("T:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
-        break;
-      case 1:
-        lcd.printf("Tur:%2.0f%% F:%2.1f", r.turbidityPercent, r.flowRateLMin);
-        break;
-      default:
-        lcd.printf("Lv:%2.0f%% V:%.1fL", r.tankLevelPercent, volumeL);
-        break;
-    }
-    return;
-  }
-
-  if (pendingQueueCount > 0) {
-    lcd.setCursor(0, 0);
-    lcd.print("SYNC SD:");
-    printLcdQueueCount(pendingQueueCount);
-    lcd.setCursor(0, 1);
-    lcd.printf("T:%2.1f pH:%2.1f", r.temperatureC, r.ph);
-    return;
-  }
-
-  lcd.setCursor(0, 1);
-  lcd.printf("Lv:%2.0f%% Vol:%.1fL", r.tankLevelPercent, volumeL);
-
-  if (r.flowRateLMin > 0.2f) {
-    lcd.setCursor(0, 0);
-    lcd.printf("Flow:%2.1fL/m", r.flowRateLMin);
-    return;
-  }
-
-  switch (cycleIndex % 2) {
-    case 0:
-      lcd.setCursor(0, 0);
-      lcd.printf("Temp:%2.1fC pH:%2.1f", r.temperatureC, r.ph);
-      break;
-
-    case 1:
-      lcd.setCursor(0, 0);
-      lcd.printf("Tur:%2.0f%% R:%d", r.turbidityPercent, r.colorR);
-      break;
-  }
+  buildMetricLine(r, cycleIndex, line0);
+  buildStatusLine(r, showSyncFlash, line1);
+  writeLcdRow(0, line0);
+  writeLcdRow(1, line1);
 }
 
 void setup() {
@@ -1060,6 +1120,8 @@ void setup() {
 
   ds18b20.begin();
   ds18b20.setResolution(10);
+  ds18b20.setWaitForConversion(false);
+  serviceTemperatureSensor();
 
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   sdReady = SD.begin(PIN_SD_CS);
@@ -1082,6 +1144,8 @@ void setup() {
 
 void loop() {
   ensureWiFiConnected();
+  serviceTemperatureSensor();
+  tryFlushPendingQueue();
 
   if (Serial.available()) {
     String command = Serial.readStringUntil('\n');
@@ -1100,15 +1164,7 @@ void loop() {
     latestReading.ultrasonicSensorOk = ultrasonicOk;
     latestReading.hasWater = tankLevel > 0.5f;
     latestReading.uptimeSeconds = now / 1000UL;
-    
-    // Only trigger LCD cycle reset once per tank scan cycle (not continuously)
-    if (!tankScanTriggered) {
-      tankScanTriggered = true;
-      lcdCycleIndex = 0;  // Reset cycle index only once when scan triggers
-    }
-    
-    Serial.printf("[TANK SCAN] Level: %.1f%% | Water: %s\n", 
-                  tankLevel, latestReading.hasWater ? "YES" : "NO");
+    latestReading.sdCardSyncing = isQueueSyncActive();
   }
 
   // Telemetry sampling and upload. Offline/dashboard failures are written to SD.
@@ -1121,23 +1177,15 @@ void loop() {
     String timestamp = buildTimestamp();
     String recordId = buildRecordId();
     latestReading.pendingQueueCount = pendingQueueCount;
+    latestReading.sdCardSyncing = isQueueSyncActive();
 
     logToSd(latestReading, timestamp, recordId);
-
-    // Backlog is uploaded first. Live records wait in SD until old records are drained.
-    if (pendingQueueCount > 0) {
-      tryFlushPendingQueue();
-    }
 
     String payload;
     buildTelemetryPayload(latestReading, timestamp, recordId, payload);
 
     bool sent = false;
-    if (pendingQueueCount > 0) {
-      if (!enqueuePayloadToSd(payload)) {
-        Serial.println("WARNING: Failed to enqueue payload to SD");
-      }
-    } else if (shouldAttemptDashboardNow()) {
+    if (shouldAttemptDashboardNow()) {
       sent = sendPayloadToDashboard(payload);
       if (!sent && !enqueuePayloadToSd(payload)) {
         Serial.println("WARNING: Failed to enqueue payload to SD");
@@ -1148,32 +1196,35 @@ void loop() {
       }
     }
 
-    Serial.println("=== ESP32 Water Reading ===");
-    Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-    Serial.printf("Dashboard: %s\n", isDashboardOnline() ? "Online" : "Offline");
-    Serial.printf("Queue: %lu\n", static_cast<unsigned long>(pendingQueueCount));
-    Serial.printf("Water Present: %s\n", latestReading.hasWater ? "YES" : "NO");
-    Serial.printf("Tank: %.1f %%\n", latestReading.tankLevelPercent);
-    Serial.printf("Temp: %.2f C (ok=%d)\n", latestReading.temperatureC, latestReading.temperatureSensorOk ? 1 : 0);
-    Serial.printf("pH: %.2f at %.3f V (ok=%d)\n", latestReading.ph, latestReading.phVoltage, latestReading.phSensorOk ? 1 : 0);
-    Serial.printf("Turbidity: %.2f %% at %.3f V (ok=%d)\n", latestReading.turbidityPercent, latestReading.turbidityVoltage, latestReading.turbiditySensorOk ? 1 : 0);
-    Serial.printf("Flow: %.2f L/min (%s)\n", latestReading.flowRateLMin, latestReading.flowSensorState);
+    latestReading.pendingQueueCount = pendingQueueCount;
+    latestReading.sdCardSyncing = isQueueSyncActive();
+
+    if (lastStatusLogMs == 0 || now - lastStatusLogMs >= STATUS_LOG_INTERVAL_MS) {
+      lastStatusLogMs = now;
+      Serial.println("=== ESP32 Water Reading ===");
+      Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+      Serial.printf("Dashboard: %s\n", isDashboardOnline() ? "Online" : "Offline");
+      Serial.printf("Queue: %lu | Sync: %s\n",
+                    static_cast<unsigned long>(pendingQueueCount),
+                    latestReading.sdCardSyncing ? "YES" : "NO");
+      Serial.printf("Water Present: %s\n", latestReading.hasWater ? "YES" : "NO");
+      Serial.printf("Tank: %.1f %%\n", latestReading.tankLevelPercent);
+      Serial.printf("Temp: %.2f C (ok=%d)\n", latestReading.temperatureC, latestReading.temperatureSensorOk ? 1 : 0);
+      Serial.printf("pH: %.2f at %.3f V (ok=%d)\n", latestReading.ph, latestReading.phVoltage, latestReading.phSensorOk ? 1 : 0);
+      Serial.printf("Turbidity: %.2f %% at %.3f V (ok=%d)\n", latestReading.turbidityPercent, latestReading.turbidityVoltage, latestReading.turbiditySensorOk ? 1 : 0);
+      Serial.printf("Flow: %.2f L/min (%s)\n", latestReading.flowRateLMin, latestReading.flowSensorState);
+    }
   }
 
-  // LCD cycling - syncs with dashboard display
-  if (now - lastLcdMs >= LCD_CYCLE_INTERVAL_MS || lastLcdMs == 0) {
-    lastLcdMs = now;
-    
-    if (tankScanTriggered) {
-      updateLcd(latestReading, lcdCycleIndex);
-      lcdCycleIndex++;
-      
-      if (lcdCycleIndex >= 3) {
-        tankScanTriggered = false;
-        lcdCycleIndex = 0;
-      }
-    } else {
-      updateLcd(latestReading, 0);
+  if (lastLcdCycleMs == 0 || now - lastLcdCycleMs >= LCD_CYCLE_INTERVAL_MS) {
+    if (lastLcdCycleMs != 0) {
+      lcdCycleIndex = (lcdCycleIndex + 1) % 3;
     }
+    lastLcdCycleMs = now;
+  }
+
+  if (lastLcdMs == 0 || now - lastLcdMs >= LCD_REFRESH_INTERVAL_MS) {
+    lastLcdMs = now;
+    updateLcd(latestReading, lcdCycleIndex);
   }
 }

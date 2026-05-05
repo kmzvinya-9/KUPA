@@ -21,6 +21,7 @@ interface SystemStatusProps {
   uptime: string
   sdCardActive?: boolean
   sdCardWriting?: boolean
+  sdCardSyncing?: boolean
   sdCardUsage?: number
   pendingQueueCount?: number
 }
@@ -33,6 +34,7 @@ export function SystemStatus({
   uptime,
   sdCardActive = true,
   sdCardWriting = false,
+  sdCardSyncing = false,
   sdCardUsage = 45,
   pendingQueueCount = 0,
 }: SystemStatusProps) {
@@ -117,12 +119,13 @@ export function SystemStatus({
             <div className="flex items-center gap-2">
               <HardDrive className={cn(
                 "h-4 w-4",
+                sdCardSyncing && "animate-pulse",
                 sdCardActive ? "text-primary" : "text-destructive"
               )} />
               <span className="text-sm font-medium text-foreground">SD Card</span>
             </div>
             <div className="flex items-center gap-2">
-              {sdCardWriting && <Save className="h-3 w-3 animate-pulse text-warning" />}
+              {(sdCardWriting || sdCardSyncing) && <Save className="h-3 w-3 animate-pulse text-warning" />}
               <Badge
                 variant="outline"
                 className={cn(
@@ -158,7 +161,12 @@ export function SystemStatus({
                 />
               </div>
               <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                {sdCardWriting ? (
+                {sdCardSyncing ? (
+                  <>
+                    <Activity className="h-3 w-3 animate-pulse text-warning" />
+                    <span>Uploading offline history in background</span>
+                  </>
+                ) : sdCardWriting ? (
                   <>
                     <Save className="h-3 w-3 animate-pulse text-warning" />
                     <span>Writing live data...</span>

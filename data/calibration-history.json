@@ -1,0 +1,63 @@
+[
+  {
+    "timestamp": "2026-05-04T19:22:02.481Z",
+    "action": "cal ph7",
+    "values": {
+      "phOffset": 25.81
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:22:06.363Z",
+    "action": "cal ph7",
+    "values": {
+      "phOffset": 25.81
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:33:32.195Z",
+    "action": "cal ph7",
+    "values": {
+      "phOffset": 25.81
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:41:45.765Z",
+    "action": "cal ph7",
+    "values": {
+      "phOffset": 25.81
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:45:19.364Z",
+    "action": "cal ph7",
+    "values": {
+      "phOffset": 24.6304135
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:46:01.853Z",
+    "action": "cal color",
+    "values": {
+      "colorBaselineR": 202,
+      "colorBaselineG": 190,
+      "colorBaselineB": 255,
+      "colorBaselineReady": true
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:46:14.237Z",
+    "action": "cal all",
+    "values": {
+      "phOffset": 24.6896707,
+      "turbidityClearVoltage": 3.3,
+      "colorBaselineR": 198,
+      "colorBaselineG": 186,
+      "colorBaselineB": 255
+    }
+  },
+  {
+    "timestamp": "2026-05-04T19:46:59.888Z",
+    "action": "cal reset",
+    "values": {}
+  }
+]

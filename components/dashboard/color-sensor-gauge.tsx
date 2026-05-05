@@ -127,7 +127,7 @@ export function ColorSensorGauge({
             {/* Additional Info */}
             <div className="grid grid-cols-2 gap-2">
               <div className="rounded bg-secondary/50 p-2">
-                <p className="text-xs text-muted-foreground">Clear Channel</p>
+                <p className="text-xs text-muted-foreground">Avg Intensity</p>
                 <p className="font-mono text-sm text-foreground">{clearValue}</p>
               </div>
               <div className="rounded bg-secondary/50 p-2">
@@ -138,7 +138,7 @@ export function ColorSensorGauge({
 
             <div className="rounded border border-border bg-secondary/20 p-2">
               <p className="text-xs text-muted-foreground">
-                Optical channels are normalized against the transparent container baseline, so stable clear-tin readings should stay near full-scale.
+                Optical channels are scaled directly from the live TCS3200 pulse timing, so changes on the sensor should show up immediately on the hardware LCD and here on the dashboard.
               </p>
             </div>
 

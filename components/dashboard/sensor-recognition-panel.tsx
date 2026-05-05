@@ -23,7 +23,7 @@ interface SensorRecognitionPanelProps {
 type SensorRow = {
   key: string
   name: string
-  ok: boolean
+  status: "recognized" | "standby" | "offline" | "check"
   detail: string
 }
 
@@ -49,41 +49,41 @@ export function SensorRecognitionPanel({
 
   // When ESP32 is offline, show all sensors as offline (not as "check wiring")
   const rows: SensorRow[] = [
-    { 
-      key: "temp", 
-      name: "DS18B20 Temperature", 
-      ok: isConnected ? temperatureSensorOk : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : (temperatureSensorOk ? "Digital sensor returning valid temperature" : "No valid DS18B20 reading") 
+    {
+      key: "temp",
+      name: "DS18B20 Temperature",
+      status: !isConnected ? "offline" : temperatureSensorOk ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : (temperatureSensorOk ? "Digital sensor returning valid temperature" : "No valid DS18B20 reading"),
     },
-    { 
-      key: "ph", 
-      name: "pH Probe", 
-      ok: isConnected ? phSensorOk : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (phSensorOk ? `Signal present at ${phVoltage.toFixed(2)} V` : "No stable pH probe signal") : "Waiting for water sample before pH verification") 
+    {
+      key: "ph",
+      name: "pH Probe",
+      status: !isConnected ? "offline" : !hasWater ? "standby" : phSensorOk ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (phSensorOk ? `Signal present at ${phVoltage.toFixed(2)} V` : "No stable pH probe signal") : "Waiting for water sample before pH verification"),
     },
-    { 
-      key: "turbidity", 
-      name: "Turbidity Sensor", 
-      ok: isConnected ? turbiditySensorOk : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (turbiditySensorOk ? `Analog signal present at ${turbidityVoltage.toFixed(2)} V` : "No stable turbidity signal") : "Waiting for water sample before turbidity verification") 
+    {
+      key: "turbidity",
+      name: "Turbidity Sensor",
+      status: !isConnected ? "offline" : !hasWater ? "standby" : turbiditySensorOk ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (turbiditySensorOk ? `Analog signal present at ${turbidityVoltage.toFixed(2)} V` : "No stable turbidity signal") : "Waiting for water sample before turbidity verification"),
     },
-    { 
-      key: "ultrasonic", 
-      name: "Ultrasonic Level", 
-      ok: isConnected ? ultrasonicSensorOk : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : (ultrasonicSensorOk ? "Distance echo detected" : "No ultrasonic echo received") 
+    {
+      key: "ultrasonic",
+      name: "Ultrasonic Level",
+      status: !isConnected ? "offline" : ultrasonicSensorOk ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : (ultrasonicSensorOk ? "Distance echo detected" : "No ultrasonic echo received"),
     },
-    { 
-      key: "color", 
-      name: "TCS3200 / TCS230 Color", 
-      ok: isConnected ? colorSensorOk : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (colorSensorOk ? "RGB pulse outputs detected" : "No color pulse response detected") : "Waiting for water sample before color verification") 
+    {
+      key: "color",
+      name: "TCS3200 / TCS230 Color",
+      status: !isConnected ? "offline" : !hasWater ? "standby" : colorSensorOk ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : (hasWater ? (colorSensorOk ? "RGB pulse outputs detected" : "No color pulse response detected") : "Waiting for water sample before color verification"),
     },
-    { 
-      key: "flow", 
-      name: "Flow Sensor", 
-      ok: isConnected ? flowSensorState !== "unknown" : false, 
-      detail: !isConnected ? "ESP32 offline - waiting for data" : flowDetail 
+    {
+      key: "flow",
+      name: "Flow Sensor",
+      status: !isConnected ? "offline" : !hasWater ? "standby" : flowSensorState !== "unknown" ? "recognized" : "check",
+      detail: !isConnected ? "ESP32 offline - waiting for data" : flowDetail,
     },
   ]
 
@@ -105,15 +105,20 @@ export function SensorRecognitionPanel({
                   <p className="text-xs text-muted-foreground">{row.detail}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  {!isConnected ? (
+                  {row.status === "offline" ? (
                     <>
                       <AlertTriangle className="h-4 w-4 text-yellow-500" />
                       <span className="text-xs font-medium text-yellow-500">Offline</span>
                     </>
-                  ) : row.ok ? (
+                  ) : row.status === "recognized" ? (
                     <>
                       <CheckCircle2 className="h-4 w-4 text-primary" />
                       <span className="text-xs font-medium text-primary">Recognized</span>
+                    </>
+                  ) : row.status === "standby" ? (
+                    <>
+                      <ActivitySquare className="h-4 w-4 text-muted-foreground" />
+                      <span className="text-xs font-medium text-muted-foreground">Standby</span>
                     </>
                   ) : (
                     <>

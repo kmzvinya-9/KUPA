@@ -4,6 +4,8 @@ import { getDashboardPayload } from '@/lib/telemetry-store'
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
+const DASHBOARD_STALE_AFTER_MS = 4500
+
 export async function GET() {
   try {
     const payload = getDashboardPayload()
@@ -12,7 +14,7 @@ export async function GET() {
     if (!payload) {
       return NextResponse.json({
         connected: false,
-        staleAfterMs: 15000,
+        staleAfterMs: DASHBOARD_STALE_AFTER_MS,
         reading: {
           recordId: 'offline',
           deviceId: 'ESP32-WATER-01',
@@ -35,6 +37,7 @@ export async function GET() {
           pulseCount: 0,
           sdCardActive: false,
           sdCardWriting: false,
+          sdCardSyncing: false,
           sdCardUsage: 0,
           uptimeSeconds: 0,
           pendingQueueCount: 0,
@@ -63,7 +66,7 @@ export async function GET() {
     console.error('Error in /api/latest:', error)
     return NextResponse.json({
       connected: false,
-      staleAfterMs: 15000,
+      staleAfterMs: DASHBOARD_STALE_AFTER_MS,
       reading: {
         recordId: 'error',
         deviceId: 'ESP32-WATER-01',
@@ -86,6 +89,7 @@ export async function GET() {
         pulseCount: 0,
         sdCardActive: false,
         sdCardWriting: false,
+        sdCardSyncing: false,
         sdCardUsage: 0,
         uptimeSeconds: 0,
         pendingQueueCount: 0,

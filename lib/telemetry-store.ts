@@ -26,6 +26,7 @@ export type TelemetryRecord = {
   pulseCount: number
   sdCardActive: boolean
   sdCardWriting: boolean
+  sdCardSyncing: boolean
   sdCardUsage: number
   uptimeSeconds: number
   pendingQueueCount: number
@@ -50,6 +51,9 @@ type TelemetryStore = {
   loadedFromDisk: boolean
 }
 
+const DASHBOARD_STALE_AFTER_MS = 4500
+const FLOW_INVALID_READING_L_MIN = 199.5
+
 declare global {
   // eslint-disable-next-line no-var
   var __esp32TelemetryStore__: TelemetryStore | undefined
@@ -71,6 +75,26 @@ function createEmptyStore(): TelemetryStore {
 
 function getRecordIdentity(record: Pick<TelemetryRecord, 'recordId' | 'deviceId' | 'timestamp'>) {
   return record.recordId || `${record.deviceId}:${record.timestamp}`
+}
+
+function getRecordTimestampMs(record: Pick<TelemetryRecord, 'timestamp' | 'receivedAt'> | null | undefined) {
+  if (!record) return 0
+  const parsed = new Date(record.timestamp).getTime()
+  if (Number.isFinite(parsed)) return parsed
+  return Number.isFinite(record.receivedAt) ? record.receivedAt : 0
+}
+
+function shouldReplaceLatest(current: TelemetryRecord | null, candidate: TelemetryRecord) {
+  if (!current) return true
+
+  const currentTs = getRecordTimestampMs(current)
+  const candidateTs = getRecordTimestampMs(candidate)
+
+  if (candidateTs !== currentTs) {
+    return candidateTs > currentTs
+  }
+
+  return candidate.receivedAt >= current.receivedAt
 }
 
 function ensurePersistenceLoaded(store: TelemetryStore) {
@@ -95,6 +119,9 @@ function ensurePersistenceLoaded(store: TelemetryStore) {
             if (store.ids.has(identity)) continue
             store.records.push(parsed)
             store.ids.add(identity)
+            if (shouldReplaceLatest(store.latest, parsed)) {
+              store.latest = parsed
+            }
           } catch {
             // ignore invalid history line
           }
@@ -109,8 +136,10 @@ function ensurePersistenceLoaded(store: TelemetryStore) {
         const content = fs.readFileSync(TELEMETRY_LATEST_FILE, 'utf8')
         if (content && content.trim()) {
           const latest = JSON.parse(content) as TelemetryRecord
-          store.latest = latest
           store.ids.add(getRecordIdentity(latest))
+          if (shouldReplaceLatest(store.latest, latest)) {
+            store.latest = latest
+          }
           if (!store.records.some((record) => getRecordIdentity(record) === getRecordIdentity(latest))) {
             store.records = [...store.records.slice(-(MAX_RECORDS - 1)), latest]
           }
@@ -302,10 +331,11 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
   })()
 
   const hasWater = !zeroSensors
-  const temperatureC = zeroSensors ? 0 : clamp(toFiniteNumber(payload.temperatureC, 0), 0, 125)
+  const temperatureC = clamp(toFiniteNumber(payload.temperatureC, 0), 0, 125)
   const ph = zeroSensors ? 0 : clamp(toFiniteNumber(payload.ph, 0), 0, 14)
   const turbidityPercent = zeroSensors ? 0 : clamp(toFiniteNumber(payload.turbidityPercent, 0), 0, 100)
-  const flowRateLMin = zeroSensors ? 0 : clamp(toFiniteNumber(payload.flowRateLMin, 0), 0, 200)
+  const normalizedFlowRate = zeroSensors ? 0 : clamp(toFiniteNumber(payload.flowRateLMin, 0), 0, 200)
+  const flowRateLMin = normalizedFlowRate >= FLOW_INVALID_READING_L_MIN ? 0 : normalizedFlowRate
   const lux = zeroSensors ? 0 : clamp(toFiniteNumber(payload.lux, 0), 0, 200000)
   const phVoltage = zeroSensors ? 0 : clamp(toFiniteNumber(payload.phVoltage, 0), 0, 3.3)
   const turbidityVoltage = zeroSensors ? 0 : clamp(toFiniteNumber(payload.turbidityVoltage, 0), 0, 3.3)
@@ -335,14 +365,15 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
     pulseCount: zeroSensors ? 0 : Math.max(0, Math.round(toFiniteNumber(payload.pulseCount, 0))),
     sdCardActive: toBoolean(payload.sdCardActive),
     sdCardWriting: toBoolean(payload.sdCardWriting),
+    sdCardSyncing: toBoolean(payload.sdCardSyncing),
     sdCardUsage: clamp(toFiniteNumber(payload.sdCardUsage, 0), 0, 100),
     uptimeSeconds: Math.max(0, Math.round(toFiniteNumber(payload.uptimeSeconds, 0))),
     pendingQueueCount: Math.max(0, Math.round(toFiniteNumber(payload.pendingQueueCount, 0))),
-    temperatureSensorOk: hasWater ? toBoolean(payload.temperatureSensorOk, temperatureC > 0) : true,
-    phSensorOk: hasWater ? toBoolean(payload.phSensorOk, phVoltage > 0.05) : true,
-    turbiditySensorOk: hasWater ? toBoolean(payload.turbiditySensorOk, turbidityVoltage > 0.05) : true,
+    temperatureSensorOk: toBoolean(payload.temperatureSensorOk, temperatureC > 0),
+    phSensorOk: toBoolean(payload.phSensorOk, phVoltage > 0.05),
+    turbiditySensorOk: toBoolean(payload.turbiditySensorOk, turbidityVoltage > 0.05),
     ultrasonicSensorOk: toBoolean(payload.ultrasonicSensorOk, rawTankLevelPercent >= 0),
-    colorSensorOk: hasWater ? toBoolean(payload.colorSensorOk, (sanitizeInt(payload.colorR) + sanitizeInt(payload.colorG) + sanitizeInt(payload.colorB)) > 0) : true,
+    colorSensorOk: toBoolean(payload.colorSensorOk, (sanitizeInt(payload.colorR) + sanitizeInt(payload.colorG) + sanitizeInt(payload.colorB)) > 0),
     flowSensorState: toFlowSensorState(payload.flowSensorState, hasWater, flowRateLMin),
     sensorsForcedOff,
     phVoltage,
@@ -360,17 +391,21 @@ export function saveTelemetry(record: TelemetryRecord) {
   const identity = getRecordIdentity(record)
 
   if (store.ids.has(identity)) {
-    store.latest = record
-    persistLatest(record)
+    if (shouldReplaceLatest(store.latest, record) || getRecordIdentity(store.latest ?? record) === identity) {
+      store.latest = record
+      persistLatest(record)
+    }
     return false
   }
 
   store.ids.add(identity)
-  store.latest = record
   store.records = [...store.records.slice(-(MAX_RECORDS - 1)), record]
 
   appendHistoryRecord(record)
-  persistLatest(record)
+  if (shouldReplaceLatest(store.latest, record)) {
+    store.latest = record
+    persistLatest(record)
+  }
 
   if (store.records.length >= MAX_RECORDS || store.records.length % 250 === 0) {
     compactHistoryFile(store.records)
@@ -384,6 +419,7 @@ function withTelemetryDefaults(record: TelemetryRecord): TelemetryRecord {
   return {
     ...record,
     pendingQueueCount: Number.isFinite(record.pendingQueueCount) ? record.pendingQueueCount : 0,
+    sdCardSyncing: Boolean(record.sdCardSyncing),
   }
 }
 
@@ -400,24 +436,24 @@ export function getLatestReading(): TelemetryRecord | null {
 export function getDashboardPayload() {
   const store = getTelemetryStore()
   const latest = store.latest ? withTelemetryDefaults(store.latest) : null
-  const staleAfterMs = 15000
+  const staleAfterMs = DASHBOARD_STALE_AFTER_MS
 
   if (!latest || Date.now() - latest.receivedAt > staleAfterMs) {
     return {
       connected: false,
       staleAfterMs,
-      reading: {
-        recordId: latest?.recordId ?? 'offline',
-        deviceId: latest?.deviceId ?? 'ESP32-WATER-01',
-        timestamp: latest?.timestamp ?? null,
-        receivedAt: latest?.receivedAt ?? null,
+      reading: latest ?? {
+        recordId: 'offline',
+        deviceId: 'ESP32-WATER-01',
+        timestamp: '',
+        receivedAt: 0,
         hasWater: false,
         temperatureC: 0,
         ph: 0,
         turbidityPercent: 0,
         flowRateLMin: 0,
         tankLevelPercent: 0,
-        tankCapacity: latest?.tankCapacity ?? 100,
+        tankCapacity: 100,
         colorR: 0,
         colorG: 0,
         colorB: 0,
@@ -426,17 +462,18 @@ export function getDashboardPayload() {
         batteryVoltage: 0,
         isCharging: false,
         pulseCount: 0,
-        sdCardActive: latest?.sdCardActive ?? false,
+        sdCardActive: false,
         sdCardWriting: false,
-        sdCardUsage: latest?.sdCardUsage ?? 0,
-        uptimeSeconds: latest?.uptimeSeconds ?? 0,
-        pendingQueueCount: latest?.pendingQueueCount ?? 0,
-        temperatureSensorOk: latest?.temperatureSensorOk ?? false,
-        phSensorOk: latest?.phSensorOk ?? false,
-        turbiditySensorOk: latest?.turbiditySensorOk ?? false,
-        ultrasonicSensorOk: latest?.ultrasonicSensorOk ?? false,
-        colorSensorOk: latest?.colorSensorOk ?? false,
-        flowSensorState: latest?.flowSensorState ?? 'unknown',
+        sdCardSyncing: false,
+        sdCardUsage: 0,
+        uptimeSeconds: 0,
+        pendingQueueCount: 0,
+        temperatureSensorOk: false,
+        phSensorOk: false,
+        turbiditySensorOk: false,
+        ultrasonicSensorOk: false,
+        colorSensorOk: false,
+        flowSensorState: 'unknown',
         sensorsForcedOff: false,
         phVoltage: 0,
         turbidityVoltage: 0,

@@ -40,6 +40,7 @@ type TelemetryReading = {
   pulseCount: number
   sdCardActive: boolean
   sdCardWriting: boolean
+  sdCardSyncing: boolean
   sdCardUsage: number
   uptimeSeconds: number
   pendingQueueCount: number
@@ -90,6 +91,7 @@ type DailyPoint = {
 
 const LIVE_BUCKET_MS = 5 * 60 * 1000
 const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000
+const CONNECTION_HOLD_MS = 4500
 
 const EMPTY_READING: TelemetryReading = {
   recordId: "offline",
@@ -110,6 +112,7 @@ const EMPTY_READING: TelemetryReading = {
   pulseCount: 0,
   sdCardActive: false,
   sdCardWriting: false,
+  sdCardSyncing: false,
   sdCardUsage: 0,
   uptimeSeconds: 0,
   pendingQueueCount: 0,
@@ -580,7 +583,10 @@ export function DashboardPage() {
   const [colorBDailyHistory, setColorBDailyHistory] = useState<DailyPoint[]>([])
   const lastAppliedRecordIdRef = useRef<string | null>(null)
   const wasConnectedRef = useRef(false)
+  const lastHistoryRefreshMsRef = useRef(0)
   const sdCardUsageRef = useRef<HTMLDivElement | null>(null)
+  const lastGoodReadingRef = useRef<TelemetryReading | null>(null)
+  const lastGoodReadingAtRef = useRef(0)
 
   const loadHistory = useCallback(async () => {
     try {
@@ -606,48 +612,46 @@ export function DashboardPage() {
       setColorGDailyHistory(buildDailySeries(payload.records, (r) => r.colorG))
       setColorBDailyHistory(buildDailySeries(payload.records, (r) => r.colorB))
 
-      const lastRecord = payload.records[payload.records.length - 1]
-      lastAppliedRecordIdRef.current = lastRecord?.recordId ?? null
+      const newestRecord = payload.records.reduce<TelemetryReading | null>((latest, candidate) => {
+        if (!latest) return candidate
+        return toTimestampMs(candidate.timestamp) >= toTimestampMs(latest.timestamp) ? candidate : latest
+      }, null)
+
+      lastAppliedRecordIdRef.current = newestRecord?.recordId ?? null
     } catch {
       // ignore
     }
   }, [])
 
   const applyLatest = useCallback((payload: LatestResponse) => {
-    const nextReading = payload.connected
-      ? payload.reading
-      : {
-          ...payload.reading,
-          ...EMPTY_READING,
-          deviceId: payload.reading.deviceId || EMPTY_READING.deviceId,
-          tankCapacity: payload.reading.tankCapacity || 100,
-          sdCardActive: payload.reading.sdCardActive,
-          sdCardWriting: payload.reading.sdCardWriting,
-          sdCardUsage: payload.reading.sdCardUsage,
-          uptimeSeconds: payload.reading.uptimeSeconds,
-          pendingQueueCount: payload.reading.pendingQueueCount,
-          temperatureSensorOk: payload.reading.temperatureSensorOk,
-          phSensorOk: payload.reading.phSensorOk,
-          turbiditySensorOk: payload.reading.turbiditySensorOk,
-          ultrasonicSensorOk: payload.reading.ultrasonicSensorOk,
-          colorSensorOk: payload.reading.colorSensorOk,
-          flowSensorState: payload.reading.flowSensorState,
-          sensorsForcedOff: payload.reading.sensorsForcedOff,
-          screeningScore: payload.reading.screeningScore,
-          screeningStatus: payload.reading.screeningStatus,
-          screeningSummary: payload.reading.screeningSummary,
-        }
+    const payloadReading = payload.reading?.recordId ? payload.reading : EMPTY_READING
+    const now = Date.now()
 
-    setIsConnected(payload.connected)
+    if (payload.connected && payloadReading.timestamp) {
+      lastGoodReadingRef.current = payloadReading
+      lastGoodReadingAtRef.current = now
+    }
+
+    const withinHold =
+      lastGoodReadingAtRef.current > 0 &&
+      now - lastGoodReadingAtRef.current <= Math.max(payload.staleAfterMs, CONNECTION_HOLD_MS)
+
+    const nextReading = payload.connected
+      ? payloadReading
+      : lastGoodReadingRef.current ?? payloadReading ?? EMPTY_READING
+
+    const effectiveConnected = payload.connected || withinHold
+
+    setIsConnected(effectiveConnected)
     setReading(nextReading)
     setLastUpdate(formatClock(nextReading.timestamp))
 
-    if (payload.connected && !wasConnectedRef.current) {
+    if (effectiveConnected && !wasConnectedRef.current) {
       void loadHistory()
     }
-    wasConnectedRef.current = payload.connected
+    wasConnectedRef.current = effectiveConnected
 
-    if (!payload.connected || !nextReading.timestamp) {
+    if (!effectiveConnected || !nextReading.timestamp) {
       return
     }
 
@@ -683,10 +687,26 @@ export function DashboardPage() {
       }
       const payload = (await response.json()) as LatestResponse
       applyLatest(payload)
+
+      const shouldRefreshHistory =
+        payload.connected &&
+        (payload.reading.sdCardSyncing || payload.reading.pendingQueueCount > 0)
+
+      if (shouldRefreshHistory) {
+        const now = Date.now()
+        if (now - lastHistoryRefreshMsRef.current >= 3000) {
+          lastHistoryRefreshMsRef.current = now
+          void loadHistory()
+        }
+      }
     } catch {
-      applyLatest({ connected: false, staleAfterMs: 15000, reading: EMPTY_READING })
+      applyLatest({
+        connected: false,
+        staleAfterMs: CONNECTION_HOLD_MS,
+        reading: lastGoodReadingRef.current ?? EMPTY_READING,
+      })
     }
-  }, [applyLatest])
+  }, [applyLatest, loadHistory])
 
   const refreshDashboard = useCallback(async () => {
     setIsRefreshing(true)
@@ -703,7 +723,7 @@ export function DashboardPage() {
     void fetchLatest()
     const interval = window.setInterval(() => {
       void fetchLatest()
-    }, 2000)  // Poll every 2 seconds for stable real-time updates
+    }, 1000)
     return () => window.clearInterval(interval)
   }, [fetchLatest, loadHistory])
 
@@ -886,6 +906,7 @@ export function DashboardPage() {
                 uptime={formatUptime(reading.uptimeSeconds)}
                 sdCardActive={reading.sdCardActive}
                 sdCardWriting={reading.sdCardWriting}
+                sdCardSyncing={reading.sdCardSyncing}
                 sdCardUsage={reading.sdCardUsage}
                 pendingQueueCount={reading.pendingQueueCount}
               />
@@ -898,7 +919,7 @@ export function DashboardPage() {
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <div className={`h-2 w-2 rounded-full ${isConnected ? "animate-pulse bg-primary" : "bg-destructive"}`} />
                 <span className={isConnected ? "" : "font-semibold text-warning animate-pulse"}>
-                  {isConnected ? "Last 24 hours • 5-minute buckets • real-time polling" : "Offline • Showing historical data"}
+                  {isConnected ? "Last 24 hours • 5-minute buckets • 1-second live polling" : "Offline • Showing historical data"}
                 </span>
               </div>
             </div>
@@ -948,8 +969,8 @@ export function DashboardPage() {
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Storage State</span>
-                    <span className={`text-sm font-medium ${reading.sdCardWriting ? "text-yellow-500" : "text-primary"}`}>
-                      {reading.sdCardWriting ? "Writing..." : "Ready"}
+                    <span className={`text-sm font-medium ${(reading.sdCardSyncing || reading.sdCardWriting) ? "text-yellow-500" : "text-primary"}`}>
+                      {reading.sdCardSyncing ? "Syncing history..." : reading.sdCardWriting ? "Writing..." : "Ready"}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">

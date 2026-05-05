@@ -1,0 +1,10 @@
+{
+  "phOffset": 7,
+  "turbidityClearVoltage": 3.3,
+  "turbidityDirtyVoltage": 0,
+  "colorBaselineR": 255,
+  "colorBaselineG": 255,
+  "colorBaselineB": 255,
+  "colorBaselineReady": false,
+  "lastUpdated": "2026-05-04T19:46:59.887Z"
+}
