@@ -1,3 +1,4 @@
+
 #if __has_include(<time.h>)
 #include <time.h>
 #elif __has_include(<ctime>)
@@ -21,10 +22,6 @@
 // Wi-Fi / Dashboard config (from secrets.h)
 // =========================
 #include "secrets.h"
-
-#ifndef CALIBRATION_COMMAND_URL
-#define CALIBRATION_COMMAND_URL ""
-#endif
 
 // =========================
 // Pin mapping
@@ -65,12 +62,10 @@ constexpr uint32_t LCD_REFRESH_INTERVAL_MS = 300;   // LCD refresh for status bl
 constexpr uint32_t LCD_CYCLE_INTERVAL_MS = 1500;    // LCD cycles through readings every 1.5 seconds
 constexpr uint32_t WIFI_RETRY_MS = 5000;            // Non-blocking WiFi retry cadence
 constexpr uint32_t DASHBOARD_RETRY_MS = 3000;       // Avoid blocking every loop when dashboard is down
-constexpr uint32_t CALIBRATION_POLL_INTERVAL_MS = 1000;
 constexpr uint32_t QUEUE_FLUSH_INTERVAL_MS = 350;   // Small SD upload slices keep readings responsive
 constexpr uint8_t QUEUE_FLUSH_MAX_RECORDS = 1;
 constexpr uint16_t HTTP_TIMEOUT_MS = 900;
-constexpr uint32_t TEMPERATURE_CONVERSION_MS = 250;
-constexpr uint8_t TEMPERATURE_MAX_MISSES = 6;
+constexpr uint32_t TEMPERATURE_CONVERSION_MS = 200;
 constexpr uint32_t STATUS_LOG_INTERVAL_MS = 2000;
 constexpr uint32_t SD_SYNC_BLINK_INTERVAL_MS = 300;
 constexpr float ADC_VREF = 3.3f;
@@ -86,11 +81,10 @@ constexpr float PH_STABLE_DELTA = 0.12f;
 constexpr uint8_t ULTRASONIC_BURST_SAMPLES = 5;
 constexpr unsigned long ULTRASONIC_TIMEOUT_US = 5000UL;
 constexpr float ULTRASONIC_SMOOTHING_ALPHA = 0.85f;
-constexpr unsigned long COLOR_PULSE_TIMEOUT_US = 60000UL;
+constexpr unsigned long COLOR_PULSE_TIMEOUT_US = 25000UL;
 constexpr float COLOR_BASELINE_ALPHA = 0.02f;
 constexpr int COLOR_BALANCE_TOLERANCE = 24;
 constexpr int COLOR_BASELINE_MIN = 40;
-constexpr float FLOW_INVALID_READING_L_MIN = 199.5f;
 constexpr uint32_t SERIAL_BAUD_RATE = 115200;
 const char* SD_LOG_FILE = "/water_log.csv";
 const char* SD_QUEUE_FILE = "/pending_queue.jsonl";
@@ -109,7 +103,6 @@ struct Reading {
   float turbidityPercent;
   float flowRateLMin;
   float tankLevelPercent;
-  float tankDistanceCm;
   float tankCapacity;
   int colorR;
   int colorG;
@@ -140,7 +133,6 @@ uint32_t lastLcdCycleMs = 0;
 uint32_t lastTankScanMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastDashboardAttemptMs = 0;
-uint32_t lastCalibrationPollMs = 0;
 uint32_t lastQueueFlushMs = 0;
 uint32_t lastStatusLogMs = 0;
 uint8_t lcdCycleIndex = 0;
@@ -152,9 +144,6 @@ bool phFirstReading = true;
 float lastStablePh = PH_NEUTRAL_DEFAULT;
 float turbidityClearVoltage = TURBIDITY_CLEAR_V;
 float turbidityDirtyVoltage = TURBIDITY_DIRTY_V;
-float temperatureOffsetC = TEMPERATURE_OFFSET_C;
-float tankEmptyDistanceCm = TANK_TOTAL_HEIGHT_CM;
-float tankFullDistanceCm = TANK_TOTAL_HEIGHT_CM - TANK_MAX_WATER_HEIGHT_CM;
 float lastDistanceCm = TANK_TOTAL_HEIGHT_CM;
 bool ultrasonicHasLastValue = false;
 float colorBaselineR = 255.0f;
@@ -167,8 +156,6 @@ uint32_t recordCounter = 0;
 uint32_t bootId = 0;
 bool temperatureRequestInFlight = false;
 bool cachedTemperatureOk = false;
-bool temperatureSensorEverSeen = false;
-uint8_t consecutiveTemperatureMisses = 0;
 float cachedTemperatureC = 0.0f;
 uint32_t lastTemperatureRequestMs = 0;
 bool sdSyncBlinkVisible = false;
@@ -304,34 +291,6 @@ void initializeColorCalibration() {
   colorBaselineReady = false;
 }
 
-void initializeTankCalibration() {
-  tankEmptyDistanceCm = TANK_TOTAL_HEIGHT_CM;
-  tankFullDistanceCm = TANK_TOTAL_HEIGHT_CM - TANK_MAX_WATER_HEIGHT_CM;
-}
-
-void normalizeTankCalibration() {
-  tankEmptyDistanceCm = clampf(tankEmptyDistanceCm, 0.0f, 500.0f);
-  tankFullDistanceCm = clampf(tankFullDistanceCm, 0.0f, 500.0f);
-
-  if (tankFullDistanceCm >= tankEmptyDistanceCm - 0.5f) {
-    tankFullDistanceCm = max(0.0f, tankEmptyDistanceCm - TANK_MAX_WATER_HEIGHT_CM);
-  }
-}
-
-void calibrateTankEmpty(float distanceCm) {
-  tankEmptyDistanceCm = clampf(distanceCm, 0.0f, 500.0f);
-  normalizeTankCalibration();
-}
-
-void calibrateTankFull(float distanceCm) {
-  tankFullDistanceCm = clampf(distanceCm, 0.0f, 500.0f);
-  normalizeTankCalibration();
-}
-
-void initializeTemperatureCalibration() {
-  temperatureOffsetC = TEMPERATURE_OFFSET_C;
-}
-
 void saveCalibrationState() {
   if (!preferences.begin("watercal", false)) {
     Serial.println("Calibration save skipped.");
@@ -345,9 +304,6 @@ void saveCalibrationState() {
   preferences.putFloat("colBaseG", colorBaselineG);
   preferences.putFloat("colBaseB", colorBaselineB);
   preferences.putBool("colReady", colorBaselineReady);
-  preferences.putFloat("tankEmpty", tankEmptyDistanceCm);
-  preferences.putFloat("tankFull", tankFullDistanceCm);
-  preferences.putFloat("tempOffset", temperatureOffsetC);
   preferences.end();
 }
 
@@ -364,15 +320,11 @@ void loadCalibrationState() {
   colorBaselineG = preferences.getFloat("colBaseG", colorBaselineG);
   colorBaselineB = preferences.getFloat("colBaseB", colorBaselineB);
   colorBaselineReady = preferences.getBool("colReady", colorBaselineReady);
-  tankEmptyDistanceCm = preferences.getFloat("tankEmpty", tankEmptyDistanceCm);
-  tankFullDistanceCm = preferences.getFloat("tankFull", tankFullDistanceCm);
-  temperatureOffsetC = preferences.getFloat("tempOffset", temperatureOffsetC);
   preferences.end();
 
   if (turbidityClearVoltage <= turbidityDirtyVoltage) {
     turbidityClearVoltage = max(turbidityDirtyVoltage + 0.1f, turbidityClearVoltage);
   }
-  normalizeTankCalibration();
 }
 
 void calibrateColorBaselineNow(int rawR, int rawG, int rawB) {
@@ -417,8 +369,6 @@ void printCalibrationStatus() {
   Serial.printf("pH offset: %.4f\n", phCalibrationOffset);
   Serial.printf("Turbidity clear V: %.3f | dirty V: %.3f\n", turbidityClearVoltage, turbidityDirtyVoltage);
   Serial.printf("Color baseline: R %.1f | G %.1f | B %.1f | ready=%d\n", colorBaselineR, colorBaselineG, colorBaselineB, colorBaselineReady ? 1 : 0);
-  Serial.printf("Tank empty distance: %.2f cm | full distance: %.2f cm\n", tankEmptyDistanceCm, tankFullDistanceCm);
-  Serial.printf("Temperature offset: %.2f C\n", temperatureOffsetC);
 }
 
 void printCalibrationHelp() {
@@ -430,152 +380,7 @@ void printCalibrationHelp() {
   Serial.println("  cal turbidity-clear");
   Serial.println("  cal turbidity-dirty");
   Serial.println("  cal color");
-  Serial.println("  cal tank-empty");
-  Serial.println("  cal tank-full");
-  Serial.println("  cal temperature");
   Serial.println("  cal reset");
-}
-
-bool applyCalibrationCommand(String command, String &messageOut, bool hasTemperatureOffset = false, float requestedTemperatureOffsetC = 0.0f) {
-  command.trim();
-  command.toLowerCase();
-  if (command.length() == 0) {
-    messageOut = "Empty calibration command.";
-    return false;
-  }
-
-  if (command == "status") {
-    messageOut = "Calibration status returned by ESP32.";
-    printCalibrationStatus();
-    return true;
-  }
-
-  if (command == "cal reset") {
-    initializePhAutoCalibration();
-    initializeTurbidityCalibration();
-    initializeColorCalibration();
-    initializeTankCalibration();
-    initializeTemperatureCalibration();
-    saveCalibrationState();
-    messageOut = "ESP32 calibration state reset to defaults.";
-    return true;
-  }
-
-  bool ok = true;
-  bool changed = false;
-  String notes = "";
-
-  if (command == "cal ph7" || command == "cal all") {
-    if (latestReading.hasWater && latestReading.phSensorOk) {
-      calibratePhNeutral(latestReading.phVoltage);
-      changed = true;
-      Serial.printf("pH baseline captured at %.3f V\n", latestReading.phVoltage);
-      notes += "pH baseline captured; ";
-    } else {
-      ok = false;
-      Serial.println("pH calibration skipped.");
-      notes += "pH skipped; ";
-    }
-  }
-
-  if (command == "cal turbidity-clear" || command == "cal all") {
-    if (latestReading.hasWater && latestReading.turbiditySensorOk) {
-      calibrateTurbidityClear(latestReading.turbidityVoltage);
-      changed = true;
-      Serial.printf("Turbidity clear baseline: %.3f V\n", latestReading.turbidityVoltage);
-      notes += "turbidity clear captured; ";
-    } else {
-      ok = false;
-      Serial.println("Turbidity clear calibration skipped.");
-      notes += "turbidity clear skipped; ";
-    }
-  }
-
-  if (command == "cal turbidity-dirty") {
-    if (latestReading.hasWater && latestReading.turbiditySensorOk) {
-      calibrateTurbidityDirty(latestReading.turbidityVoltage);
-      changed = true;
-      Serial.printf("Turbidity dirty baseline: %.3f V\n", latestReading.turbidityVoltage);
-      notes += "turbidity dirty captured; ";
-    } else {
-      ok = false;
-      Serial.println("Turbidity dirty calibration skipped.");
-      notes += "turbidity dirty skipped; ";
-    }
-  }
-
-  if (command == "cal color" || command == "cal all") {
-    bool colorOk = false;
-    int rawR = 0;
-    int rawG = 0;
-    int rawB = 0;
-    readRawColorSensor(rawR, rawG, rawB, colorOk);
-    if (latestReading.hasWater && colorOk) {
-      calibrateColorBaselineNow(rawR, rawG, rawB);
-      changed = true;
-      Serial.printf("Color baseline: R %d | G %d | B %d\n", rawR, rawG, rawB);
-      notes += "color baseline captured; ";
-    } else {
-      ok = false;
-      Serial.println("Color calibration skipped.");
-      notes += "color skipped; ";
-    }
-  }
-
-  if (command == "cal tank-empty") {
-    if (latestReading.ultrasonicSensorOk && latestReading.tankDistanceCm > 0.0f) {
-      calibrateTankEmpty(latestReading.tankDistanceCm);
-      changed = true;
-      Serial.printf("Tank empty baseline: %.2f cm\n", latestReading.tankDistanceCm);
-      notes += "tank empty baseline captured; ";
-    } else {
-      ok = false;
-      Serial.println("Tank empty calibration skipped.");
-      notes += "tank empty skipped; ";
-    }
-  }
-
-  if (command == "cal tank-full") {
-    if (latestReading.ultrasonicSensorOk && latestReading.tankDistanceCm > 0.0f) {
-      calibrateTankFull(latestReading.tankDistanceCm);
-      changed = true;
-      Serial.printf("Tank full baseline: %.2f cm\n", latestReading.tankDistanceCm);
-      notes += "tank full baseline captured; ";
-    } else {
-      ok = false;
-      Serial.println("Tank full calibration skipped.");
-      notes += "tank full skipped; ";
-    }
-  }
-
-  if (command == "cal temperature") {
-    if (latestReading.temperatureSensorOk && hasTemperatureOffset) {
-      const float previousOffsetC = temperatureOffsetC;
-      temperatureOffsetC = clampf(requestedTemperatureOffsetC, -20.0f, 20.0f);
-      if (cachedTemperatureOk) {
-        cachedTemperatureC = (cachedTemperatureC - previousOffsetC) + temperatureOffsetC;
-      }
-      changed = true;
-      Serial.printf("Temperature offset set: %.2f C\n", temperatureOffsetC);
-      notes += "temperature offset applied; ";
-    } else {
-      ok = false;
-      Serial.println("Temperature calibration skipped.");
-      notes += "temperature skipped; ";
-    }
-  }
-
-  if (command != "cal all" && command != "cal ph7" && command != "cal turbidity-clear" && command != "cal turbidity-dirty" && command != "cal color" && command != "cal tank-empty" && command != "cal tank-full" && command != "cal temperature") {
-    messageOut = "Unknown calibration command.";
-    return false;
-  }
-
-  if (changed) {
-    saveCalibrationState();
-  }
-
-  messageOut = notes.length() > 0 ? notes : "No calibration values changed.";
-  return ok && changed;
 }
 
 void handleCalibrationCommand(String command) {
@@ -588,21 +393,73 @@ void handleCalibrationCommand(String command) {
     return;
   }
 
-  String message;
-  bool ok = applyCalibrationCommand(command, message);
-  Serial.println(message);
-  if (command == "status") return;
-  if (!ok) {
-    printCalibrationHelp();
+  if (command == "status") {
+    printCalibrationStatus();
+    return;
   }
-  printCalibrationStatus();
-}
 
-bool isValidTemperatureReading(float temp) {
-  if (temp == DEVICE_DISCONNECTED_C || !isfinite(temp)) return false;
-  if (temp <= -50.0f || temp >= 125.0f) return false;
-  if (!temperatureSensorEverSeen && fabs(temp - 85.0f) < 0.01f) return false;
-  return true;
+  if (command == "cal reset") {
+    initializePhAutoCalibration();
+    initializeTurbidityCalibration();
+    initializeColorCalibration();
+    saveCalibrationState();
+    Serial.println("Calibration state reset to defaults.");
+    printCalibrationStatus();
+    return;
+  }
+
+  if (command == "cal ph7" || command == "cal all") {
+    if (latestReading.hasWater && latestReading.phSensorOk) {
+      calibratePhNeutral(latestReading.phVoltage);
+      saveCalibrationState();
+      Serial.printf("pH baseline captured at %.3f V\n", latestReading.phVoltage);
+    } else {
+      Serial.println("pH calibration skipped.");
+    }
+  }
+
+  if (command == "cal turbidity-clear" || command == "cal all") {
+    if (latestReading.hasWater && latestReading.turbiditySensorOk) {
+      calibrateTurbidityClear(latestReading.turbidityVoltage);
+      saveCalibrationState();
+      Serial.printf("Turbidity clear baseline: %.3f V\n", latestReading.turbidityVoltage);
+    } else {
+      Serial.println("Turbidity clear calibration skipped.");
+    }
+  }
+
+  if (command == "cal turbidity-dirty") {
+    if (latestReading.hasWater && latestReading.turbiditySensorOk) {
+      calibrateTurbidityDirty(latestReading.turbidityVoltage);
+      saveCalibrationState();
+      Serial.printf("Turbidity dirty baseline: %.3f V\n", latestReading.turbidityVoltage);
+    } else {
+      Serial.println("Turbidity dirty calibration skipped.");
+    }
+  }
+
+  if (command == "cal color" || command == "cal all") {
+    bool colorOk = false;
+    int rawR = 0;
+    int rawG = 0;
+    int rawB = 0;
+    readRawColorSensor(rawR, rawG, rawB, colorOk);
+    if (latestReading.hasWater && colorOk) {
+      calibrateColorBaselineNow(rawR, rawG, rawB);
+      saveCalibrationState();
+      Serial.printf("Color baseline: R %d | G %d | B %d\n", rawR, rawG, rawB);
+    } else {
+      Serial.println("Color calibration skipped.");
+    }
+  }
+
+  if (command != "help" && command != "status" && command != "cal all" && command != "cal ph7" && command != "cal turbidity-clear" && command != "cal turbidity-dirty" && command != "cal color" && command != "cal reset") {
+    Serial.println("Unknown command.");
+    printCalibrationHelp();
+    return;
+  }
+
+  printCalibrationStatus();
 }
 
 void serviceTemperatureSensor() {
@@ -617,22 +474,20 @@ void serviceTemperatureSensor() {
     return;
   }
 
-  const uint8_t deviceCount = ds18b20.getDeviceCount();
-  const float temp = deviceCount > 0 ? ds18b20.getTempCByIndex(0) : DEVICE_DISCONNECTED_C;
-  const bool readingOk = isValidTemperatureReading(temp);
+  float total = 0.0f;
+  int ok = 0;
 
-  if (readingOk) {
-    cachedTemperatureC = temp + temperatureOffsetC;
-    cachedTemperatureOk = true;
-    temperatureSensorEverSeen = true;
-    consecutiveTemperatureMisses = 0;
-  } else {
-    if (consecutiveTemperatureMisses < 255) {
-      consecutiveTemperatureMisses++;
+  for (int i = 0; i < 2; i++) {
+    const float temp = ds18b20.getTempCByIndex(0);
+    if (temp != DEVICE_DISCONNECTED_C && temp > -50.0f && temp < 125.0f) {
+      total += temp;
+      ok++;
     }
-    if (!temperatureSensorEverSeen || consecutiveTemperatureMisses > TEMPERATURE_MAX_MISSES) {
-      cachedTemperatureOk = false;
-    }
+  }
+
+  cachedTemperatureOk = ok > 0;
+  if (cachedTemperatureOk) {
+    cachedTemperatureC = (total / ok) + TEMPERATURE_OFFSET_C;
   }
 
   ds18b20.requestTemperatures();
@@ -641,7 +496,7 @@ void serviceTemperatureSensor() {
 
 float readTemperatureC(bool &sensorOk) {
   sensorOk = cachedTemperatureOk;
-  return temperatureSensorEverSeen ? cachedTemperatureC : 0.0f;
+  return sensorOk ? cachedTemperatureC : 0.0f;
 }
 
 float readPh(bool &sensorOk, float &voltageOut) {
@@ -668,7 +523,7 @@ float readPh(bool &sensorOk, float &voltageOut) {
 
 float readTurbidityPercent(bool &sensorOk, float &voltageOut) {
   voltageOut = readTrimmedAnalogVoltage(PIN_TURBIDITY, 12, 1);
-  sensorOk = voltageOut > 0.005f;
+  sensorOk = voltageOut > 0.02f;
   const float span = max(0.01f, turbidityClearVoltage - turbidityDirtyVoltage);
   float percent = ((voltageOut - turbidityDirtyVoltage) / span) * 100.0f;
   return clampf(percent, 0.0f, 100.0f);
@@ -728,9 +583,11 @@ float readDistanceCm(bool &sensorOk) {
   return lastDistanceCm;
 }
 
-float distanceToTankLevelPercent(float distanceCm) {
-  const float span = max(0.5f, tankEmptyDistanceCm - tankFullDistanceCm);
-  float percent = ((tankEmptyDistanceCm - distanceCm) / span) * 100.0f;
+float readTankLevelPercent(bool &sensorOk) {
+  float distance = readDistanceCm(sensorOk);
+  float waterHeight = TANK_TOTAL_HEIGHT_CM - distance;
+  waterHeight = clampf(waterHeight, 0.0f, TANK_MAX_WATER_HEIGHT_CM);
+  float percent = (waterHeight / TANK_MAX_WATER_HEIGHT_CM) * 100.0f;
   return clampf(percent, 0.0f, 100.0f);
 }
 
@@ -741,35 +598,21 @@ uint32_t readColorPulse(bool s2, bool s3) {
   return pulseIn(PIN_TCS_OUT, LOW, COLOR_PULSE_TIMEOUT_US);
 }
 
+int pulseToColor(uint32_t pulse) {
+  if (pulse == 0) return 0;
+  long mapped = map((long)constrain((int)pulse, 20, 300), 20, 300, 255, 0);
+  return constrain((int)mapped, 0, 255);
+}
+
 void readRawColorSensor(int &r, int &g, int &b, bool &sensorOk) {
   uint32_t pulseR = readColorPulse(LOW, LOW);
   uint32_t pulseG = readColorPulse(HIGH, HIGH);
   uint32_t pulseB = readColorPulse(LOW, HIGH);
 
-  sensorOk = pulseR > 0 || pulseG > 0 || pulseB > 0;
-  if (!sensorOk) {
-    r = 0;
-    g = 0;
-    b = 0;
-    return;
-  }
-
-  const float strengthR = pulseR > 0 ? 1000000.0f / pulseR : 0.0f;
-  const float strengthG = pulseG > 0 ? 1000000.0f / pulseG : 0.0f;
-  const float strengthB = pulseB > 0 ? 1000000.0f / pulseB : 0.0f;
-  const float strongest = max(strengthR, max(strengthG, strengthB));
-
-  if (strongest <= 0.0f) {
-    sensorOk = false;
-    r = 0;
-    g = 0;
-    b = 0;
-    return;
-  }
-
-  r = constrain((int)roundf((strengthR / strongest) * 255.0f), 0, 255);
-  g = constrain((int)roundf((strengthG / strongest) * 255.0f), 0, 255);
-  b = constrain((int)roundf((strengthB / strongest) * 255.0f), 0, 255);
+  sensorOk = pulseR > 0 && pulseG > 0 && pulseB > 0;
+  r = pulseToColor(pulseR);
+  g = pulseToColor(pulseG);
+  b = pulseToColor(pulseB);
 }
 
 void readColorSensor(int &r, int &g, int &b, int &lux, bool &sensorOk, bool hasWater) {
@@ -778,21 +621,18 @@ void readColorSensor(int &r, int &g, int &b, int &lux, bool &sensorOk, bool hasW
   int rawB = 0;
   readRawColorSensor(rawR, rawG, rawB, sensorOk);
 
-  (void)hasWater;
-  r = rawR;
-  g = rawG;
-  b = rawB;
+  updateColorBaseline(rawR, rawG, rawB, hasWater, sensorOk);
+
+  r = colorBaselineReady ? normalizeColorChannel(rawR, colorBaselineR) : rawR;
+  g = colorBaselineReady ? normalizeColorChannel(rawG, colorBaselineG) : rawG;
+  b = colorBaselineReady ? normalizeColorChannel(rawB, colorBaselineB) : rawB;
   lux = constrain((r + g + b) / 3, 0, 255) * 4;
 }
 
 float pulsesToFlowRateLMin(uint32_t pulses, uint32_t sampleWindowMs) {
-  if (sampleWindowMs == 0 || pulses == 0) return 0.0f;
+  if (sampleWindowMs == 0) return 0.0f;
   const float frequencyHz = (pulses * 1000.0f) / sampleWindowMs;
-  const float flowRate = clampf(frequencyHz / FLOW_HZ_PER_L_MIN, 0.0f, 200.0f);
-  if (!isfinite(flowRate) || flowRate >= FLOW_INVALID_READING_L_MIN) {
-    return 0.0f;
-  }
-  return flowRate;
+  return clampf(frequencyHz / FLOW_HZ_PER_L_MIN, 0.0f, 200.0f);
 }
 
 float computeSdUsagePercent() {
@@ -845,7 +685,6 @@ void zeroReading(Reading &r) {
   r.turbidityPercent = 0.0f;
   r.flowRateLMin = 0.0f;
   r.tankLevelPercent = 0.0f;
-  r.tankDistanceCm = tankEmptyDistanceCm;
   r.colorR = 0;
   r.colorG = 0;
   r.colorB = 0;
@@ -904,8 +743,18 @@ void buildMetricLine(const Reading &r, uint8_t cycleIndex, char *lineOut) {
 }
 
 void buildStatusLine(const Reading &r, bool showSyncFlash, char *lineOut) {
-  (void)showSyncFlash;
   const float volumeL = r.tankCapacity * (r.tankLevelPercent / 100.0f);
+
+  if (!isDashboardOnline()) {
+    snprintf(lineOut, 17, "Lv%.0f%% %.1fL OFF", r.tankLevelPercent, volumeL);
+    return;
+  }
+
+  if (showSyncFlash) {
+    snprintf(lineOut, 17, "Lv%.0f%% %.1fL SD", r.tankLevelPercent, volumeL);
+    return;
+  }
+
   snprintf(lineOut, 17, "Lv%.0f%% %.1fL", r.tankLevelPercent, volumeL);
 }
 
@@ -940,7 +789,6 @@ void buildTelemetryPayload(const Reading &r, const String &timestamp, const Stri
   doc["turbidityPercent"] = r.turbidityPercent;
   doc["flowRateLMin"] = r.flowRateLMin;
   doc["tankLevelPercent"] = r.tankLevelPercent;
-  doc["tankDistanceCm"] = r.tankDistanceCm;
   doc["tankCapacity"] = r.tankCapacity;
   doc["colorR"] = r.colorR;
   doc["colorG"] = r.colorG;
@@ -1007,145 +855,6 @@ bool sendPayloadToDashboard(const String &body) {
   http.end();
   dashboardReachable = statusCode >= 200 && statusCode < 300;
   return dashboardReachable;
-}
-
-String getCalibrationCommandUrl() {
-  String configured = String(CALIBRATION_COMMAND_URL);
-  configured.trim();
-  if (configured.length() > 0) {
-    return configured;
-  }
-
-  String url = String(SERVER_URL);
-  url.replace("/api/ingest", "/api/calibration/command");
-  return url;
-}
-
-bool fetchCalibrationCommand(String &commandIdOut, String &commandOut, bool &hasTemperatureOffsetOut, float &temperatureOffsetOut) {
-  commandIdOut = "";
-  commandOut = "";
-  hasTemperatureOffsetOut = false;
-  temperatureOffsetOut = 0.0f;
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-
-  HTTPClient http;
-  http.begin(getCalibrationCommandUrl());
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("x-api-key", API_KEY);
-  http.addHeader("x-device-id", DEVICE_ID);
-
-  int statusCode = http.GET();
-  String response = http.getString();
-  http.end();
-
-  if (statusCode < 200 || statusCode >= 300) {
-    Serial.printf("GET calibration command -> %d\n", statusCode);
-    if (response.length() > 0) {
-      Serial.println(response);
-    }
-    return false;
-  }
-
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, response);
-  if (error) {
-    Serial.printf("Calibration command JSON parse failed: %s\n", error.c_str());
-    return false;
-  }
-
-  JsonVariant commandValue = doc["command"];
-  if (commandValue.isNull()) {
-    return true;
-  }
-
-  const char* id = commandValue["id"] | "";
-  const char* command = commandValue["command"] | "";
-  commandIdOut = String(id);
-  commandOut = String(command);
-  if (!commandValue["calibration"]["temperatureOffsetC"].isNull()) {
-    temperatureOffsetOut = commandValue["calibration"]["temperatureOffsetC"] | 0.0f;
-    hasTemperatureOffsetOut = true;
-  }
-  return commandIdOut.length() > 0 && commandOut.length() > 0;
-}
-
-bool reportCalibrationCommandResult(const String &commandId, bool ok, const String &message) {
-  if (WiFi.status() != WL_CONNECTED || commandId.length() == 0) {
-    return false;
-  }
-
-  JsonDocument doc;
-  doc["commandId"] = commandId;
-  doc["deviceId"] = DEVICE_ID;
-  doc["apiKey"] = API_KEY;
-  doc["ok"] = ok;
-  doc["message"] = message;
-  JsonObject calibration = doc["calibration"].to<JsonObject>();
-  calibration["phOffset"] = phCalibrationOffset;
-  calibration["turbidityClearVoltage"] = turbidityClearVoltage;
-  calibration["turbidityDirtyVoltage"] = turbidityDirtyVoltage;
-  calibration["colorBaselineR"] = colorBaselineR;
-  calibration["colorBaselineG"] = colorBaselineG;
-  calibration["colorBaselineB"] = colorBaselineB;
-  calibration["colorBaselineReady"] = colorBaselineReady;
-  calibration["tankEmptyDistanceCm"] = tankEmptyDistanceCm;
-  calibration["tankFullDistanceCm"] = tankFullDistanceCm;
-  calibration["temperatureOffsetC"] = temperatureOffsetC;
-
-  String body;
-  serializeJson(doc, body);
-
-  HTTPClient http;
-  http.begin(getCalibrationCommandUrl());
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-api-key", API_KEY);
-  http.addHeader("x-device-id", DEVICE_ID);
-
-  int statusCode = http.POST(body);
-  String response = http.getString();
-  http.end();
-
-  Serial.printf("POST calibration result -> %d\n", statusCode);
-  if (response.length() > 0) {
-    Serial.println(response);
-  }
-
-  return statusCode >= 200 && statusCode < 300;
-}
-
-void pollCalibrationCommand() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  uint32_t now = millis();
-  if (lastCalibrationPollMs != 0 && now - lastCalibrationPollMs < CALIBRATION_POLL_INTERVAL_MS) {
-    return;
-  }
-  lastCalibrationPollMs = now;
-
-  String commandId;
-  String command;
-  bool hasTemperatureOffset = false;
-  float temperatureOffset = 0.0f;
-  if (!fetchCalibrationCommand(commandId, command, hasTemperatureOffset, temperatureOffset)) {
-    return;
-  }
-
-  if (commandId.length() == 0 || command.length() == 0) {
-    return;
-  }
-
-  Serial.printf("Dashboard calibration command: %s (%s)\n", command.c_str(), commandId.c_str());
-  String resultMessage;
-  bool ok = applyCalibrationCommand(command, resultMessage, hasTemperatureOffset, temperatureOffset);
-  Serial.println(resultMessage);
-  printCalibrationStatus();
-  reportCalibrationCommandResult(commandId, ok, resultMessage);
 }
 
 uint32_t countPendingQueueRecords() {
@@ -1307,7 +1016,6 @@ void collectNonTankReadings(Reading &r, uint32_t sampleWindowMs) {
 Reading collectReading(uint32_t sampleWindowMs) {
   Reading r{};
   r.tankLevelPercent = latestReading.tankLevelPercent;
-  r.tankDistanceCm = latestReading.tankDistanceCm;
   r.ultrasonicSensorOk = latestReading.ultrasonicSensorOk;
   r.hasWater = latestReading.hasWater;
   
@@ -1323,10 +1031,10 @@ void logToSd(const Reading &r, const String &timestamp, const String &recordId) 
 
   latestReading.sdCardWriting = true;
   if (file.size() == 0) {
-    file.println("recordId,timestamp,hasWater,tempC,ph,phVoltage,turbidityPct,turbidityVoltage,flowLMin,tankPct,tankDistanceCm,colorR,colorG,colorB,lux,pulseCount,pendingQueueCount");
+    file.println("recordId,timestamp,hasWater,tempC,ph,phVoltage,turbidityPct,turbidityVoltage,flowLMin,tankPct,colorR,colorG,colorB,lux,pulseCount,pendingQueueCount");
   }
   file.printf(
-    "%s,%s,%d,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%lu,%u\n",
+    "%s,%s,%d,%.2f,%.2f,%.3f,%.2f,%.3f,%.2f,%.2f,%d,%d,%d,%d,%lu,%u\n",
     recordId.c_str(),
     timestamp.c_str(),
     r.hasWater ? 1 : 0,
@@ -1337,7 +1045,6 @@ void logToSd(const Reading &r, const String &timestamp, const String &recordId) 
     r.turbidityVoltage,
     r.flowRateLMin,
     r.tankLevelPercent,
-    r.tankDistanceCm,
     r.colorR,
     r.colorG,
     r.colorB,
@@ -1374,7 +1081,6 @@ void setup() {
   pinMode(PIN_ULTRASONIC_TRIG, OUTPUT);
   pinMode(PIN_ULTRASONIC_ECHO, INPUT);
   pinMode(PIN_FLOW, INPUT_PULLUP);
-  pinMode(PIN_DS18B20, INPUT_PULLUP);
 
   pinMode(PIN_TCS_S0, OUTPUT);
   pinMode(PIN_TCS_S1, OUTPUT);
@@ -1414,8 +1120,6 @@ void setup() {
   initializePhAutoCalibration();
   initializeTurbidityCalibration();
   initializeColorCalibration();
-  initializeTankCalibration();
-  initializeTemperatureCalibration();
   loadCalibrationState();
 
   Serial.println("Setup complete.");
@@ -1441,9 +1145,7 @@ void loop() {
     lastTankScanMs = now;
     
     bool ultrasonicOk = false;
-    float tankDistance = readDistanceCm(ultrasonicOk);
-    float tankLevel = distanceToTankLevelPercent(tankDistance);
-    latestReading.tankDistanceCm = tankDistance;
+    float tankLevel = readTankLevelPercent(ultrasonicOk);
     latestReading.tankLevelPercent = tankLevel;
     latestReading.ultrasonicSensorOk = ultrasonicOk;
     latestReading.hasWater = tankLevel > 0.5f;
@@ -1493,19 +1195,12 @@ void loop() {
                     latestReading.sdCardSyncing ? "YES" : "NO");
       Serial.printf("Water Present: %s\n", latestReading.hasWater ? "YES" : "NO");
       Serial.printf("Tank: %.1f %%\n", latestReading.tankLevelPercent);
-      Serial.printf("Temp: %.2f C (ok=%d, seen=%d, misses=%u, devices=%d)\n",
-                    latestReading.temperatureC,
-                    latestReading.temperatureSensorOk ? 1 : 0,
-                    temperatureSensorEverSeen ? 1 : 0,
-                    static_cast<unsigned int>(consecutiveTemperatureMisses),
-                    static_cast<int>(ds18b20.getDeviceCount()));
+      Serial.printf("Temp: %.2f C (ok=%d)\n", latestReading.temperatureC, latestReading.temperatureSensorOk ? 1 : 0);
       Serial.printf("pH: %.2f at %.3f V (ok=%d)\n", latestReading.ph, latestReading.phVoltage, latestReading.phSensorOk ? 1 : 0);
       Serial.printf("Turbidity: %.2f %% at %.3f V (ok=%d)\n", latestReading.turbidityPercent, latestReading.turbidityVoltage, latestReading.turbiditySensorOk ? 1 : 0);
       Serial.printf("Flow: %.2f L/min (%s)\n", latestReading.flowRateLMin, latestReading.flowSensorState);
     }
   }
-
-  pollCalibrationCommand();
 
   if (lastLcdCycleMs == 0 || now - lastLcdCycleMs >= LCD_CYCLE_INTERVAL_MS) {
     if (lastLcdCycleMs != 0) {
