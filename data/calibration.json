@@ -1,10 +1,13 @@
 {
-  "phOffset": 7,
+  "phOffset": 25.81,
   "turbidityClearVoltage": 3.3,
   "turbidityDirtyVoltage": 0,
   "colorBaselineR": 255,
-  "colorBaselineG": 255,
-  "colorBaselineB": 255,
-  "colorBaselineReady": false,
-  "lastUpdated": "2026-05-04T19:46:59.887Z"
+  "colorBaselineG": 164,
+  "colorBaselineB": 185,
+  "colorBaselineReady": true,
+  "tankEmptyDistanceCm": 13,
+  "tankFullDistanceCm": 3,
+  "temperatureOffsetC": 0,
+  "lastUpdated": "2026-05-05T19:29:44.049Z"
 }

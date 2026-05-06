@@ -43,7 +43,10 @@ The file `ESP32/esp32_water_monitor_sender/secrets.h` should contain:
 #define DEVICE_ID "ESP32-WATER-01"
 #define API_KEY "esp32-water-2026"
 #define SERVER_URL "http://192.168.1.142:3000/api/ingest"
+#define CALIBRATION_COMMAND_URL "http://192.168.1.142:3000/api/calibration/command"
 ```
+
+If `CALIBRATION_COMMAND_URL` is omitted, the firmware derives it from `SERVER_URL` by replacing `/api/ingest` with `/api/calibration/command`.
 
 #### 3.2 Upload ESP32 Code
 1. Open Arduino IDE or PlatformIO
@@ -174,11 +177,14 @@ Send these commands via Serial Monitor to calibrate sensors:
 ```
 help                          # Show all commands
 status                        # Show calibration status
-cal all                       # Calibrate all sensors
+cal all                       # Calibrate pH, turbidity clear, and color
 cal ph7                       # Calibrate pH to neutral (7.0)
 cal turbidity-clear           # Calibrate turbidity for clear water
 cal turbidity-dirty           # Calibrate turbidity for dirty water
 cal color                     # Calibrate color sensor baseline
+cal tank-empty                # Capture empty tank ultrasonic baseline
+cal tank-full                 # Capture full tank ultrasonic baseline
+cal temperature               # Apply dashboard-provided temperature offset
 cal reset                     # Reset all calibrations to defaults
 ```
 

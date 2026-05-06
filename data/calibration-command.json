@@ -1,0 +1,11 @@
+{
+  "id": "1778009384050-o08vdz",
+  "command": "cal ph7",
+  "status": "failed",
+  "requestedAt": "2026-05-05T19:29:44.050Z",
+  "updatedAt": "2026-05-05T19:30:15.090Z",
+  "message": "ESP32 did not respond to the calibration command within 30 seconds.",
+  "sentAt": "2026-05-05T19:29:51.134Z",
+  "deviceId": "ESP32-WATER-01",
+  "ok": false
+}

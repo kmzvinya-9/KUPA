@@ -15,6 +15,7 @@ export type TelemetryRecord = {
   turbidityPercent: number
   flowRateLMin: number
   tankLevelPercent: number
+  tankDistanceCm: number
   tankCapacity: number
   colorR: number
   colorG: number
@@ -160,7 +161,9 @@ function ensurePersistenceLoaded(store: TelemetryStore) {
 function persistLatest(record: TelemetryRecord) {
   try {
     fs.mkdirSync(TELEMETRY_DIR, { recursive: true })
-    fs.writeFileSync(TELEMETRY_LATEST_FILE, JSON.stringify(record, null, 2))
+    const tmpFile = `${TELEMETRY_LATEST_FILE}.${process.pid}.tmp`
+    fs.writeFileSync(tmpFile, JSON.stringify(record, null, 2))
+    fs.renameSync(tmpFile, TELEMETRY_LATEST_FILE)
   } catch {
     // ignore persistence errors
   }
@@ -170,7 +173,9 @@ function compactHistoryFile(records: TelemetryRecord[]) {
   try {
     fs.mkdirSync(TELEMETRY_DIR, { recursive: true })
     const body = records.map((record) => JSON.stringify(record)).join('\n')
-    fs.writeFileSync(TELEMETRY_HISTORY_FILE, body ? `${body}\n` : '')
+    const tmpFile = `${TELEMETRY_HISTORY_FILE}.${process.pid}.tmp`
+    fs.writeFileSync(tmpFile, body ? `${body}\n` : '')
+    fs.renameSync(tmpFile, TELEMETRY_HISTORY_FILE)
   } catch {
     // ignore persistence errors
   }
@@ -302,6 +307,7 @@ function computeScreening(ph: number, turbidityPercent: number, lux: number, has
 export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryRecord {
   const tankCapacity = clamp(toFiniteNumber(payload.tankCapacity, 100), 1, 100000)
   const rawTankLevelPercent = clamp(toFiniteNumber(payload.tankLevelPercent, 0), 0, 100)
+  const tankDistanceCm = clamp(toFiniteNumber(payload.tankDistanceCm, 0), 0, 500)
   const rawHasWater = typeof payload.hasWater === 'boolean'
     ? payload.hasWater
     : rawTankLevelPercent > 0.5
@@ -331,7 +337,9 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
   })()
 
   const hasWater = !zeroSensors
-  const temperatureC = clamp(toFiniteNumber(payload.temperatureC, 0), 0, 125)
+  const rawTemperatureC = toFiniteNumber(payload.temperatureC, Number.NaN)
+  const hasTemperatureReading = Number.isFinite(rawTemperatureC)
+  const temperatureC = clamp(hasTemperatureReading ? rawTemperatureC : 0, -50, 125)
   const ph = zeroSensors ? 0 : clamp(toFiniteNumber(payload.ph, 0), 0, 14)
   const turbidityPercent = zeroSensors ? 0 : clamp(toFiniteNumber(payload.turbidityPercent, 0), 0, 100)
   const normalizedFlowRate = zeroSensors ? 0 : clamp(toFiniteNumber(payload.flowRateLMin, 0), 0, 200)
@@ -354,6 +362,7 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
     turbidityPercent,
     flowRateLMin,
     tankLevelPercent: zeroSensors ? 0 : rawTankLevelPercent,
+    tankDistanceCm,
     tankCapacity,
     colorR: zeroSensors ? 0 : sanitizeInt(payload.colorR),
     colorG: zeroSensors ? 0 : sanitizeInt(payload.colorG),
@@ -369,7 +378,7 @@ export function normalizeTelemetry(payload: Record<string, unknown>): TelemetryR
     sdCardUsage: clamp(toFiniteNumber(payload.sdCardUsage, 0), 0, 100),
     uptimeSeconds: Math.max(0, Math.round(toFiniteNumber(payload.uptimeSeconds, 0))),
     pendingQueueCount: Math.max(0, Math.round(toFiniteNumber(payload.pendingQueueCount, 0))),
-    temperatureSensorOk: toBoolean(payload.temperatureSensorOk, temperatureC > 0),
+    temperatureSensorOk: toBoolean(payload.temperatureSensorOk, hasTemperatureReading),
     phSensorOk: toBoolean(payload.phSensorOk, phVoltage > 0.05),
     turbiditySensorOk: toBoolean(payload.turbiditySensorOk, turbidityVoltage > 0.05),
     ultrasonicSensorOk: toBoolean(payload.ultrasonicSensorOk, rawTankLevelPercent >= 0),
@@ -418,8 +427,54 @@ export function saveTelemetry(record: TelemetryRecord) {
 function withTelemetryDefaults(record: TelemetryRecord): TelemetryRecord {
   return {
     ...record,
+    tankDistanceCm: Number.isFinite(record.tankDistanceCm) ? record.tankDistanceCm : 0,
     pendingQueueCount: Number.isFinite(record.pendingQueueCount) ? record.pendingQueueCount : 0,
     sdCardSyncing: Boolean(record.sdCardSyncing),
+  }
+}
+
+function createOfflineReading(latest: TelemetryRecord | null): TelemetryRecord {
+  return {
+    recordId: 'offline',
+    deviceId: latest?.deviceId || 'ESP32-WATER-01',
+    timestamp: latest?.timestamp ?? '',
+    receivedAt: latest?.receivedAt ?? 0,
+    hasWater: false,
+    temperatureC: 0,
+    ph: 0,
+    turbidityPercent: 0,
+    flowRateLMin: 0,
+    tankLevelPercent: 0,
+    tankDistanceCm: 0,
+    tankCapacity: latest?.tankCapacity ?? 100,
+    colorR: 0,
+    colorG: 0,
+    colorB: 0,
+    lux: 0,
+    batteryLevel: 0,
+    batteryVoltage: 0,
+    isCharging: false,
+    pulseCount: 0,
+    sdCardActive: false,
+    sdCardWriting: false,
+    sdCardSyncing: false,
+    sdCardUsage: 0,
+    uptimeSeconds: 0,
+    pendingQueueCount: 0,
+    temperatureSensorOk: false,
+    phSensorOk: false,
+    turbiditySensorOk: false,
+    ultrasonicSensorOk: false,
+    colorSensorOk: false,
+    flowSensorState: 'unknown',
+    sensorsForcedOff: false,
+    phVoltage: 0,
+    turbidityVoltage: 0,
+    screeningScore: 0,
+    screeningStatus: 'low',
+    screeningSummary: latest
+      ? 'ESP32 telemetry is stale. Live dashboard sensor values have been set to zero.'
+      : 'Waiting for telemetry from the ESP32.',
   }
 }
 
@@ -442,45 +497,7 @@ export function getDashboardPayload() {
     return {
       connected: false,
       staleAfterMs,
-      reading: latest ?? {
-        recordId: 'offline',
-        deviceId: 'ESP32-WATER-01',
-        timestamp: '',
-        receivedAt: 0,
-        hasWater: false,
-        temperatureC: 0,
-        ph: 0,
-        turbidityPercent: 0,
-        flowRateLMin: 0,
-        tankLevelPercent: 0,
-        tankCapacity: 100,
-        colorR: 0,
-        colorG: 0,
-        colorB: 0,
-        lux: 0,
-        batteryLevel: 0,
-        batteryVoltage: 0,
-        isCharging: false,
-        pulseCount: 0,
-        sdCardActive: false,
-        sdCardWriting: false,
-        sdCardSyncing: false,
-        sdCardUsage: 0,
-        uptimeSeconds: 0,
-        pendingQueueCount: 0,
-        temperatureSensorOk: false,
-        phSensorOk: false,
-        turbiditySensorOk: false,
-        ultrasonicSensorOk: false,
-        colorSensorOk: false,
-        flowSensorState: 'unknown',
-        sensorsForcedOff: false,
-        phVoltage: 0,
-        turbidityVoltage: 0,
-        screeningScore: 0,
-        screeningStatus: 'low',
-        screeningSummary: 'Waiting for telemetry from the ESP32.',
-      },
+      reading: createOfflineReading(latest),
     }
   }
 

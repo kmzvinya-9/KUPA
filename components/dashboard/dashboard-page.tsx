@@ -32,6 +32,7 @@ type TelemetryReading = {
   turbidityPercent: number
   flowRateLMin: number
   tankLevelPercent: number
+  tankDistanceCm: number
   tankCapacity: number
   colorR: number
   colorG: number
@@ -92,6 +93,7 @@ type DailyPoint = {
 const LIVE_BUCKET_MS = 5 * 60 * 1000
 const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 const CONNECTION_HOLD_MS = 4500
+const CONNECTION_LOST_AFTER_MS = 12000
 
 const EMPTY_READING: TelemetryReading = {
   recordId: "offline",
@@ -104,6 +106,7 @@ const EMPTY_READING: TelemetryReading = {
   turbidityPercent: 0,
   flowRateLMin: 0,
   tankLevelPercent: 0,
+  tankDistanceCm: 0,
   tankCapacity: 100,
   colorR: 0,
   colorG: 0,
@@ -628,19 +631,27 @@ export function DashboardPage() {
     const now = Date.now()
 
     if (payload.connected && payloadReading.timestamp) {
+      const readingReceivedAt = typeof payloadReading.receivedAt === "number" && Number.isFinite(payloadReading.receivedAt)
+        ? payloadReading.receivedAt
+        : now
       lastGoodReadingRef.current = payloadReading
-      lastGoodReadingAtRef.current = now
+      lastGoodReadingAtRef.current = readingReceivedAt
     }
 
     const withinHold =
       lastGoodReadingAtRef.current > 0 &&
       now - lastGoodReadingAtRef.current <= Math.max(payload.staleAfterMs, CONNECTION_HOLD_MS)
+    const withinConnectionGrace =
+      lastGoodReadingAtRef.current > 0 &&
+      now - lastGoodReadingAtRef.current <= CONNECTION_LOST_AFTER_MS
 
     const nextReading = payload.connected
       ? payloadReading
-      : lastGoodReadingRef.current ?? payloadReading ?? EMPTY_READING
+      : withinHold
+        ? lastGoodReadingRef.current ?? payloadReading
+        : payloadReading ?? EMPTY_READING
 
-    const effectiveConnected = payload.connected || withinHold
+    const effectiveConnected = payload.connected || withinConnectionGrace
 
     setIsConnected(effectiveConnected)
     setReading(nextReading)
@@ -703,7 +714,7 @@ export function DashboardPage() {
       applyLatest({
         connected: false,
         staleAfterMs: CONNECTION_HOLD_MS,
-        reading: lastGoodReadingRef.current ?? EMPTY_READING,
+        reading: EMPTY_READING,
       })
     }
   }, [applyLatest, loadHistory])
@@ -840,7 +851,7 @@ export function DashboardPage() {
             <AlertPanel alerts={activeAlerts} />
 
             <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-              <ThermometerGauge value={reading.temperatureC} min={0} max={50} warningLow={15} warningHigh={30} />
+              <ThermometerGauge value={reading.temperatureC} min={-10} max={50} warningLow={15} warningHigh={30} />
               <TurbidityGauge value={reading.turbidityPercent} hasWater={reading.hasWater} isConnected={isConnected} />
               <PhGauge value={reading.ph} classification={phClassification.classification} substance={phClassification.substance} />
             </div>
@@ -1039,15 +1050,22 @@ export function DashboardPage() {
 
           <TabsContent value="configuration" className="space-y-6">
             <CalibrationPanel
+              isConnected={isConnected}
               sensorReading={{
                 hasWater: reading.hasWater,
+                temperatureC: reading.temperatureC,
+                tankLevelPercent: reading.tankLevelPercent,
+                tankDistanceCm: reading.tankDistanceCm,
+                tankCapacity: reading.tankCapacity,
                 phVoltage: reading.phVoltage,
                 turbidityVoltage: reading.turbidityVoltage,
                 colorR: reading.colorR,
                 colorG: reading.colorG,
                 colorB: reading.colorB,
+                temperatureSensorOk: reading.temperatureSensorOk,
                 phSensorOk: reading.phSensorOk,
                 turbiditySensorOk: reading.turbiditySensorOk,
+                ultrasonicSensorOk: reading.ultrasonicSensorOk,
                 colorSensorOk: reading.colorSensorOk,
               }}
             />

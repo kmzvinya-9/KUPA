@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -17,6 +17,7 @@ import {
   Palette,
   RotateCcw,
   Save,
+  Waves,
   Info,
   CheckCircle2,
   AlertTriangle,
@@ -31,22 +32,45 @@ type CalibrationStatus = {
   colorBaselineG: number
   colorBaselineB: number
   colorBaselineReady: boolean
+  tankEmptyDistanceCm: number
+  tankFullDistanceCm: number
+  temperatureOffsetC: number
+}
+
+type CalibrationCommandState = {
+  id: string
+  command: CalCommand
+  status: "pending" | "sent" | "completed" | "failed"
+  requestedAt: string
+  updatedAt: string
+  sentAt?: string
+  completedAt?: string
+  deviceId?: string
+  ok?: boolean
+  message?: string
 }
 
 type SensorReading = {
   hasWater: boolean
+  temperatureC: number
+  tankLevelPercent: number
+  tankDistanceCm: number
+  tankCapacity: number
   phVoltage: number
   turbidityVoltage: number
   colorR: number
   colorG: number
   colorB: number
+  temperatureSensorOk: boolean
   phSensorOk: boolean
   turbiditySensorOk: boolean
+  ultrasonicSensorOk: boolean
   colorSensorOk: boolean
 }
 
 interface CalibrationPanelProps {
   sensorReading: SensorReading
+  isConnected: boolean
 }
 
 type CalCommand =
@@ -55,16 +79,23 @@ type CalCommand =
   | "cal turbidity-clear"
   | "cal turbidity-dirty"
   | "cal color"
+  | "cal tank-empty"
+  | "cal tank-full"
+  | "cal temperature"
   | "cal all"
   | "cal reset"
 
-export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
+export function CalibrationPanel({ sensorReading, isConnected }: CalibrationPanelProps) {
   const [status, setStatus] = useState<CalibrationStatus | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [message, setMessage] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null)
   const [activeTab, setActiveTab] = useState("ph")
+  const [hardwareCommand, setHardwareCommand] = useState<CalibrationCommandState | null>(null)
+  const [temperatureReferenceC, setTemperatureReferenceC] = useState("25.0")
+  const hardwareCommandId = hardwareCommand?.id ?? "none"
+  const hardwareCommandStatus = hardwareCommand?.status ?? "idle"
 
-  const fetchCalibrationStatus = async () => {
+  const fetchCalibrationStatus = useCallback(async () => {
     try {
       const response = await fetch("/api/calibration/status", { cache: "no-store" })
       if (response.ok) {
@@ -74,13 +105,34 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
     } catch (error) {
       console.error("Failed to fetch calibration status:", error)
     }
-  }
+  }, [])
+
+  const fetchHardwareCommandStatus = useCallback(async () => {
+    try {
+      const response = await fetch("/api/calibration/command", { cache: "no-store" })
+      if (!response.ok) return
+      const data = (await response.json()) as { command?: CalibrationCommandState | null }
+      setHardwareCommand(data.command ?? null)
+    } catch (error) {
+      console.error("Failed to fetch calibration command status:", error)
+    }
+  }, [])
 
   useEffect(() => {
     fetchCalibrationStatus()
-  }, [])
+    fetchHardwareCommandStatus()
+  }, [fetchCalibrationStatus, fetchHardwareCommandStatus])
 
-  const sendCalibrationCommand = async (command: CalCommand) => {
+  useEffect(() => {
+    if (!hardwareCommand || (hardwareCommand.status !== "pending" && hardwareCommand.status !== "sent")) return
+    const interval = window.setInterval(() => {
+      void fetchHardwareCommandStatus()
+      void fetchCalibrationStatus()
+    }, 1000)
+    return () => window.clearInterval(interval)
+  }, [fetchCalibrationStatus, fetchHardwareCommandStatus, hardwareCommandId, hardwareCommandStatus])
+
+  const sendCalibrationCommand = async (command: CalCommand, extraBody: Record<string, unknown> = {}) => {
     setIsLoading(true)
     setMessage(null)
 
@@ -88,14 +140,16 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
       const response = await fetch("/api/calibration/command", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command }),
+        body: JSON.stringify({ command, ...extraBody }),
       })
 
       const result = await response.json()
 
       if (result.ok) {
         setMessage({ type: "success", text: result.message })
+        setHardwareCommand(result.hardwareCommand ?? result.command ?? null)
         fetchCalibrationStatus()
+        fetchHardwareCommandStatus()
       } else {
         setMessage({ type: "error", text: result.message || "Calibration command failed" })
       }
@@ -105,6 +159,22 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
       setIsLoading(false)
     }
   }
+
+  const isHardwareBusy = hardwareCommand?.status === "pending" || hardwareCommand?.status === "sent"
+
+  const hardwareStatus = (() => {
+    if (!hardwareCommand) return null
+    if (hardwareCommand.status === "completed") {
+      return { type: "success" as const, label: "ESP32 responded", text: hardwareCommand.message ?? "Calibration command completed on the ESP32." }
+    }
+    if (hardwareCommand.status === "failed") {
+      return { type: "error" as const, label: "ESP32 failed", text: hardwareCommand.message ?? "The ESP32 reported that calibration could not be completed." }
+    }
+    if (hardwareCommand.status === "sent") {
+      return { type: "info" as const, label: "Sent to ESP32", text: hardwareCommand.message ?? "Waiting for the ESP32 calibration response." }
+    }
+    return { type: "info" as const, label: "Queued for ESP32", text: hardwareCommand.message ?? "Waiting for the ESP32 to collect the calibration command." }
+  })()
 
   const getPhStatus = () => {
     if (!sensorReading.hasWater) {
@@ -145,6 +215,42 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
     }
   }
 
+  const getTankStatus = () => {
+    if (!isConnected) {
+      return { status: "error", message: "ESP32 is offline - tank calibration requires live ultrasonic readings" }
+    }
+    if (!sensorReading.ultrasonicSensorOk) {
+      return { status: "error", message: "Ultrasonic tank sensor not recognized - check trigger/echo wiring" }
+    }
+    if (sensorReading.tankDistanceCm <= 0) {
+      return { status: "warning", message: "Waiting for an ultrasonic distance reading from updated ESP32 firmware" }
+    }
+    return {
+      status: "ok",
+      message: `Current tank level: ${sensorReading.tankLevelPercent.toFixed(1)}%`,
+    }
+  }
+
+  const getTemperatureStatus = () => {
+    if (!isConnected) {
+      return { status: "error", message: "ESP32 is offline - temperature calibration requires live readings" }
+    }
+    if (!sensorReading.temperatureSensorOk) {
+      return { status: "error", message: "DS18B20 temperature sensor not recognized - check wiring" }
+    }
+    return {
+      status: "ok",
+      message: `Current temperature: ${sensorReading.temperatureC.toFixed(2)} °C`,
+    }
+  }
+
+  const parsedTemperatureReference = Number(temperatureReferenceC)
+  const canCalibrateTemperature =
+    Number.isFinite(parsedTemperatureReference) &&
+    parsedTemperatureReference >= -50 &&
+    parsedTemperatureReference <= 125 &&
+    getTemperatureStatus().status === "ok"
+
   return (
     <Card>
       <CardHeader className="pb-2">
@@ -155,10 +261,36 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
         <CardDescription className="text-xs">
           Calibrate sensors for accurate readings. Commands are sent to the ESP32 via the dashboard API.
         </CardDescription>
+        {hardwareStatus && (
+          <Alert
+            className={cn(
+              "mt-3",
+              hardwareStatus.type === "success" && "bg-primary/10 border-primary/30",
+              hardwareStatus.type === "error" && "bg-destructive/10 border-destructive/30",
+              hardwareStatus.type === "info" && "bg-info/10 border-info/30"
+            )}
+          >
+            {hardwareStatus.type === "success" && <CheckCircle2 className="h-4 w-4 text-primary" />}
+            {hardwareStatus.type === "error" && <AlertTriangle className="h-4 w-4 text-destructive" />}
+            {hardwareStatus.type === "info" && (
+              isHardwareBusy ? <Loader className="h-4 w-4 animate-spin text-info" /> : <Info className="h-4 w-4 text-info" />
+            )}
+            <AlertDescription
+              className={cn(
+                "text-xs",
+                hardwareStatus.type === "success" && "text-primary",
+                hardwareStatus.type === "error" && "text-destructive",
+                hardwareStatus.type === "info" && "text-info"
+              )}
+            >
+              <span className="font-medium">{hardwareStatus.label}:</span> {hardwareStatus.text}
+            </AlertDescription>
+          </Alert>
+        )}
       </CardHeader>
       <CardContent>
         <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-          <TabsList className="grid grid-cols-4 gap-1">
+          <TabsList className="grid grid-cols-3 gap-1 md:grid-cols-6">
             <TabsTrigger value="ph" className="text-xs">
               <Droplet className="h-3 w-3 mr-1" />
               pH
@@ -170,6 +302,14 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
             <TabsTrigger value="color" className="text-xs">
               <Palette className="h-3 w-3 mr-1" />
               Color
+            </TabsTrigger>
+            <TabsTrigger value="tank" className="text-xs">
+              <Waves className="h-3 w-3 mr-1" />
+              Tank
+            </TabsTrigger>
+            <TabsTrigger value="temperature" className="text-xs">
+              <Thermometer className="h-3 w-3 mr-1" />
+              Temp
             </TabsTrigger>
             <TabsTrigger value="system" className="text-xs">
               <RotateCcw className="h-3 w-3 mr-1" />
@@ -223,7 +363,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
               <div className="mt-4 space-y-2">
                 <Button
                   onClick={() => sendCalibrationCommand("cal ph7")}
-                  disabled={isLoading || getPhStatus().status !== "ok"}
+                  disabled={isLoading || isHardwareBusy || getPhStatus().status !== "ok"}
                   className="w-full"
                   size="sm"
                 >
@@ -294,7 +434,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
               <div className="mt-4 space-y-3">
                 <Button
                   onClick={() => sendCalibrationCommand("cal turbidity-clear")}
-                  disabled={isLoading || getTurbidityStatus().status !== "ok"}
+                  disabled={isLoading || isHardwareBusy || getTurbidityStatus().status !== "ok"}
                   variant="outline"
                   className="w-full"
                   size="sm"
@@ -312,7 +452,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
 
                 <Button
                   onClick={() => sendCalibrationCommand("cal turbidity-dirty")}
-                  disabled={isLoading || getTurbidityStatus().status !== "ok"}
+                  disabled={isLoading || isHardwareBusy || getTurbidityStatus().status !== "ok"}
                   variant="outline"
                   className="w-full"
                   size="sm"
@@ -398,7 +538,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
               <div className="mt-4 space-y-2">
                 <Button
                   onClick={() => sendCalibrationCommand("cal color")}
-                  disabled={isLoading || getColorStatus().status !== "ok"}
+                  disabled={isLoading || isHardwareBusy || getColorStatus().status !== "ok"}
                   className="w-full"
                   size="sm"
                 >
@@ -411,6 +551,163 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
                 </Button>
                 <p className="text-[10px] text-muted-foreground">
                   Capture the current RGB values as the new baseline for color normalization.
+                </p>
+              </div>
+            </div>
+          </TabsContent>
+
+          {/* Tank Calibration */}
+          <TabsContent value="tank" className="space-y-4">
+            <div className="rounded-lg border border-border bg-secondary/10 p-4">
+              <h4 className="text-sm font-medium text-foreground mb-2">Tank Sensor Calibration</h4>
+              <p className="text-xs text-muted-foreground mb-4">
+                Capture ultrasonic distance baselines for the empty tank initial condition and full tank reference.
+              </p>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">Empty Baseline:</span>
+                  <Badge variant="outline" className="font-mono">
+                    {status?.tankEmptyDistanceCm?.toFixed(2) ?? "13.00"} cm
+                  </Badge>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">Full Baseline:</span>
+                  <Badge variant="outline" className="font-mono">
+                    {status?.tankFullDistanceCm?.toFixed(2) ?? "3.00"} cm
+                  </Badge>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">Current Distance:</span>
+                  <Badge variant="outline" className="font-mono">
+                    {sensorReading.tankDistanceCm > 0 ? `${sensorReading.tankDistanceCm.toFixed(2)} cm` : "Waiting"}
+                  </Badge>
+                </div>
+
+                {getTankStatus().status === "ok" ? (
+                  <Alert className="bg-primary/10 border-primary/30">
+                    <CheckCircle2 className="h-4 w-4 text-primary" />
+                    <AlertDescription className="text-xs text-primary">{getTankStatus().message}</AlertDescription>
+                  </Alert>
+                ) : getTankStatus().status === "warning" ? (
+                  <Alert className="bg-yellow-500/10 border-yellow-500/30">
+                    <AlertTriangle className="h-4 w-4 text-yellow-500" />
+                    <AlertDescription className="text-xs text-yellow-500">{getTankStatus().message}</AlertDescription>
+                  </Alert>
+                ) : (
+                  <Alert className="bg-destructive/10 border-destructive/30">
+                    <AlertTriangle className="h-4 w-4 text-destructive" />
+                    <AlertDescription className="text-xs text-destructive">{getTankStatus().message}</AlertDescription>
+                  </Alert>
+                )}
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <Button
+                  onClick={() => sendCalibrationCommand("cal tank-empty")}
+                  disabled={isLoading || isHardwareBusy || getTankStatus().status !== "ok"}
+                  className="w-full"
+                  size="sm"
+                >
+                  {isLoading ? (
+                    <Loader className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <Waves className="h-4 w-4 mr-2" />
+                  )}
+                  Capture Empty Tank Baseline
+                </Button>
+                <p className="text-[10px] text-muted-foreground">
+                  Use this with no water in the tank to set the startup/initial empty condition.
+                </p>
+
+                <Button
+                  onClick={() => sendCalibrationCommand("cal tank-full")}
+                  disabled={isLoading || isHardwareBusy || getTankStatus().status !== "ok"}
+                  variant="outline"
+                  className="w-full"
+                  size="sm"
+                >
+                  {isLoading ? (
+                    <Loader className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <Save className="h-4 w-4 mr-2" />
+                  )}
+                  Capture Full Tank Baseline
+                </Button>
+                <p className="text-[10px] text-muted-foreground">
+                  Fill to the normal full mark before capturing this reference.
+                </p>
+              </div>
+            </div>
+          </TabsContent>
+
+          {/* Temperature Calibration */}
+          <TabsContent value="temperature" className="space-y-4">
+            <div className="rounded-lg border border-border bg-secondary/10 p-4">
+              <h4 className="text-sm font-medium text-foreground mb-2">Temperature Sensor Calibration</h4>
+              <p className="text-xs text-muted-foreground mb-4">
+                Temperature is monitored independently from tank water state and can be offset against a known reference.
+              </p>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">Current Offset:</span>
+                  <Badge variant="outline" className="font-mono">
+                    {status?.temperatureOffsetC?.toFixed(2) ?? "0.00"} °C
+                  </Badge>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">Current Temperature:</span>
+                  <Badge variant="outline" className="font-mono">
+                    {sensorReading.temperatureC.toFixed(2)} °C
+                  </Badge>
+                </div>
+
+                {getTemperatureStatus().status === "ok" ? (
+                  <Alert className="bg-primary/10 border-primary/30">
+                    <CheckCircle2 className="h-4 w-4 text-primary" />
+                    <AlertDescription className="text-xs text-primary">{getTemperatureStatus().message}</AlertDescription>
+                  </Alert>
+                ) : (
+                  <Alert className="bg-destructive/10 border-destructive/30">
+                    <AlertTriangle className="h-4 w-4 text-destructive" />
+                    <AlertDescription className="text-xs text-destructive">{getTemperatureStatus().message}</AlertDescription>
+                  </Alert>
+                )}
+
+                <div className="space-y-2">
+                  <Label htmlFor="temperature-reference" className="text-xs text-muted-foreground">
+                    Reference Temperature (°C)
+                  </Label>
+                  <Input
+                    id="temperature-reference"
+                    inputMode="decimal"
+                    value={temperatureReferenceC}
+                    onChange={(event) => setTemperatureReferenceC(event.target.value)}
+                    className="h-9 font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="mt-4 space-y-2">
+                <Button
+                  onClick={() => sendCalibrationCommand("cal temperature", { temperatureReferenceC: parsedTemperatureReference })}
+                  disabled={isLoading || isHardwareBusy || !canCalibrateTemperature}
+                  className="w-full"
+                  size="sm"
+                >
+                  {isLoading ? (
+                    <Loader className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <Thermometer className="h-4 w-4 mr-2" />
+                  )}
+                  Calibrate Temperature Offset
+                </Button>
+                <p className="text-[10px] text-muted-foreground">
+                  Compare the DS18B20 reading with a trusted thermometer, enter the trusted value, then calibrate.
                 </p>
               </div>
             </div>
@@ -430,7 +727,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
                   <AlertDescription className="text-xs text-info">
                     <p className="font-medium mb-1">Calibration Tips:</p>
                     <ul className="list-disc list-inside space-y-1">
-                      <li>Ensure water is present in the tank before calibrating</li>
+                      <li>Use an empty tank for tank-empty calibration and water/reference samples for water-contact sensors</li>
                       <li>Wait for sensor readings to stabilize before calibrating</li>
                       <li>Use known reference solutions for best accuracy</li>
                       <li>Recalibrate periodically for maintained accuracy</li>
@@ -441,7 +738,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
                 <div className="space-y-2">
                   <Button
                     onClick={() => sendCalibrationCommand("cal all")}
-                    disabled={isLoading || !sensorReading.hasWater}
+                    disabled={isLoading || isHardwareBusy || !sensorReading.hasWater}
                     variant="outline"
                     className="w-full"
                     size="sm"
@@ -461,7 +758,7 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
                 <div className="space-y-2">
                   <Button
                     onClick={() => sendCalibrationCommand("cal reset")}
-                    disabled={isLoading}
+                    disabled={isLoading || isHardwareBusy}
                     variant="destructive"
                     className="w-full"
                     size="sm"
@@ -482,6 +779,9 @@ export function CalibrationPanel({ sensorReading }: CalibrationPanelProps) {
                       <span>Turb Clear: {status.turbidityClearVoltage.toFixed(3)}V</span>
                       <span>Turb Dirty: {status.turbidityDirtyVoltage.toFixed(3)}V</span>
                       <span>Color Ready: {status.colorBaselineReady ? "Yes" : "No"}</span>
+                      <span>Tank Empty: {status.tankEmptyDistanceCm.toFixed(2)}cm</span>
+                      <span>Tank Full: {status.tankFullDistanceCm.toFixed(2)}cm</span>
+                      <span>Temp Offset: {status.temperatureOffsetC.toFixed(2)}C</span>
                     </div>
                   </div>
                 )}

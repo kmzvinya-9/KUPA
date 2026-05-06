@@ -19,5 +19,6 @@
 #define DEVICE_ID "ESP32-WATER-01"
 #define API_KEY "replace_with_your_dashboard_api_key"
 #define SERVER_URL "http://your-computer-lan-ip:3000/api/ingest"
+#define CALIBRATION_COMMAND_URL "http://your-computer-lan-ip:3000/api/calibration/command"
 
 #endif // SECRETS_H
